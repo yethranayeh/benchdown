@@ -81,6 +81,23 @@ fn check_overrides_the_block_lengths_in_the_plan() {
 }
 
 #[test]
+fn the_plan_lists_each_rounds_order() {
+    let output = benchdown(&["run", "-n", "a", "-n", "b", "one", "two"]);
+    assert!(output.status.success());
+    let plan = text(&output.stdout);
+    for line in [
+        "Round order",
+        "  Round 1: b, a",
+        "  Round 2: a, b",
+        "  Round 3: a, b",
+        "  Round 4: b, a",
+        "  Round 5: a, b",
+    ] {
+        assert!(plan.contains(line), "{line} missing from the plan");
+    }
+}
+
+#[test]
 fn a_name_count_that_does_not_match_exits_two() {
     let output = benchdown(&["run", "-n", "only", "one", "two"]);
     assert_eq!(output.status.code(), Some(2));

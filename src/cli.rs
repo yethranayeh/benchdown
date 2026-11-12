@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand, error::ErrorKind};
 
+use crate::schedule;
+
 /// Defaults follow Zinn's measurement harness, which benchdown's method comes from.
 pub const DEFAULT_ROUNDS: u64 = 5;
 pub const DEFAULT_IDLE_SECONDS: u64 = 20;
@@ -69,12 +71,12 @@ pub struct RunArgs {
     #[arg(short = 'p', long, value_name = "CMD")]
     pub prepare: Vec<String>,
 
-    /// Rounds over the workloads
+    /// Rounds over the workloads, at most 10000
     #[arg(
         long,
         value_name = "N",
         default_value_t = DEFAULT_ROUNDS,
-        value_parser = clap::value_parser!(u64).range(1..)
+        value_parser = clap::value_parser!(u64).range(1..=10_000)
     )]
     pub rounds: u64,
 
@@ -227,6 +229,16 @@ impl Plan {
     pub fn total_seconds(&self) -> u64 {
         self.blocks() * self.seconds_per_block()
     }
+
+    /// The order each round visits the workloads in.
+    pub fn round_orders(&self) -> Vec<Vec<String>> {
+        let names: Vec<&str> = self
+            .workloads
+            .iter()
+            .map(|workload| workload.name.as_str())
+            .collect();
+        schedule::round_orders(&names, self.rounds as usize, self.seed)
+    }
 }
 
 impl fmt::Display for Plan {
@@ -237,13 +249,18 @@ impl fmt::Display for Plan {
             env!("CARGO_PKG_VERSION")
         )?;
         writeln!(formatter)?;
-        writeln!(formatter, "Workloads, in order")?;
+        writeln!(formatter, "Workloads")?;
         for (index, workload) in self.workloads.iter().enumerate() {
             writeln!(formatter, "  {}. {}", index + 1, workload.name)?;
             writeln!(formatter, "     command: {}", workload.command)?;
             if let Some(prepare) = &workload.prepare {
                 writeln!(formatter, "     prepare: {prepare}")?;
             }
+        }
+        writeln!(formatter)?;
+        writeln!(formatter, "Round order")?;
+        for (index, order) in self.round_orders().iter().enumerate() {
+            writeln!(formatter, "  Round {}: {}", index + 1, order.join(", "))?;
         }
         writeln!(formatter)?;
         let shell = match &self.shell {
@@ -439,6 +456,27 @@ mod tests {
         assert_eq!(plan.blocks(), 10);
         assert_eq!(plan.seconds_per_block(), 45);
         assert_eq!(plan.total_seconds(), 450);
+    }
+
+    #[test]
+    fn the_plan_schedules_every_round() {
+        let plan = plan(&["-n", "a", "-n", "b", "one", "two"]).expect("two named commands plan");
+        assert_eq!(
+            plan.round_orders(),
+            [["b", "a"], ["a", "b"], ["a", "b"], ["b", "a"], ["a", "b"],]
+        );
+    }
+
+    #[test]
+    fn a_check_run_still_schedules_its_one_round() {
+        let plan = plan(&["--check", "-n", "a", "-n", "b", "one", "two"]).expect("a check run");
+        assert_eq!(plan.round_orders(), [["b", "a"]]);
+    }
+
+    #[test]
+    fn rounds_are_capped_so_a_plan_stays_printable() {
+        let error = plan(&["--rounds", "20000", "one"]).expect_err("20000 rounds is refused");
+        assert!(error.contains("20000"), "{error}");
     }
 
     #[test]
