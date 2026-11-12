@@ -304,11 +304,16 @@ mod tests {
         let Some(path) = std::env::var_os("BENCHDOWN_REFERENCE_B") else {
             eprintln!(
                 "skipping: set BENCHDOWN_REFERENCE_B to a recorded power plist, \
-                 beside its blocks.tsv"
+                 or to a directory holding power.plist, beside its blocks.tsv"
             );
             return;
         };
         let path = std::path::PathBuf::from(path);
+        let path = if path.is_dir() {
+            path.join("power.plist")
+        } else {
+            path
+        };
         let Some(power_log) = read(&path) else {
             return;
         };

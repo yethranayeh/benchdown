@@ -1,5 +1,6 @@
 //! benchdown measures a command's processor energy.
 
+mod analysis;
 mod blocks;
 mod cli;
 mod random;
@@ -15,5 +16,11 @@ fn main() {
             Ok(plan) => print!("{plan}"),
             Err(message) => cli::exit_with(&message),
         },
+        cli::ArgsCommand::Analyze(analyze) => {
+            if let Err(message) = analyze.report() {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+        }
     }
 }

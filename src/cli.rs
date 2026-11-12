@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand, error::ErrorKind};
 
+use crate::analysis;
+use crate::blocks;
+use crate::samples;
 use crate::schedule;
 
 /// Defaults follow Zinn's measurement harness, which benchdown's method comes from.
@@ -40,6 +43,48 @@ pub struct Args {
 pub enum ArgsCommand {
     /// Plan and run measured work blocks for one or more commands
     Run(RunArgs),
+    /// Report energy per run from a recorded power log and block log
+    Analyze(AnalyzeArgs),
+}
+
+/// Everything `benchdown analyze` accepts.
+#[derive(Debug, ClapArgs)]
+pub struct AnalyzeArgs {
+    /// Power log written by powermetrics with -f plist
+    #[arg(value_name = "POWER")]
+    pub power: PathBuf,
+
+    /// Block log written by benchdown run
+    #[arg(value_name = "BLOCKS")]
+    pub blocks: PathBuf,
+
+    /// Print the analysis as JSON instead of a table
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl AnalyzeArgs {
+    /// Reads both logs, analyzes them and prints the result.
+    pub fn report(self) -> Result<(), String> {
+        let power = read(&self.power)?;
+        let block_log = read(&self.blocks)?;
+        let samples = samples::parse_power_log(&power);
+        let blocks = blocks::parse_blocks(&block_log)?;
+        let analysis = analysis::analyze(&samples, &blocks)?;
+
+        if self.json {
+            let json =
+                serde_json::to_string_pretty(&analysis).map_err(|error| error.to_string())?;
+            println!("{json}");
+        } else {
+            println!("{}", analysis::format_analysis(&analysis).join("\n"));
+        }
+        Ok(())
+    }
+}
+
+fn read(path: &std::path::Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// Everything `benchdown run` accepts, as typed.
@@ -339,6 +384,7 @@ mod tests {
         };
         match parsed.command {
             ArgsCommand::Run(run) => Plan::new(run),
+            ArgsCommand::Analyze(_) => unreachable!("the helper always builds a run command"),
         }
     }
 

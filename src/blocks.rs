@@ -5,11 +5,14 @@
 
 #![allow(dead_code)]
 
+use serde::Serialize;
+
 /// The columns of a block log, in order, as its header spells them.
 pub const BLOCK_COLUMNS: [&str; 6] = ["round", "label", "kind", "start", "end", "count"];
 
 /// Which half of a round a block belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BlockKind {
     Idle,
     Work,
