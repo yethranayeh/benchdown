@@ -1,0 +1,11 @@
+[package]
+name = "benchdown"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Measure a command's processor energy the way hyperfine measures its time"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
