@@ -1,7 +1,9 @@
 //! benchdown measures a command's processor energy.
 
+mod blocks;
 mod cli;
 mod random;
+mod samples;
 mod schedule;
 
 use clap::Parser;
