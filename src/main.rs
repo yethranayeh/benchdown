@@ -4,6 +4,7 @@ mod analysis;
 mod blocks;
 mod cli;
 mod clock;
+mod export;
 mod gate;
 mod powermetrics;
 mod preflight;

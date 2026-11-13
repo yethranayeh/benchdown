@@ -27,6 +27,8 @@ A run needs `sudo` for `powermetrics`, a machine on AC power and 2 GB of free
 disk. It writes `power.plist`, `blocks.tsv`, `analysis.json` and `meta.json` to
 `./benchdown-<date>/`, or to `--out <dir>`.
 
+`--export-json <file>` writes the results as hyperfine-shaped JSON (schema version 2).
+
 It reports whole-machine processor energy above an idle baseline, not the energy
 of one process.
 

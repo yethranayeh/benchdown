@@ -11,6 +11,7 @@ use crate::analysis::{
 };
 use crate::blocks::{BlockKind, BlockRow, format_header, format_row};
 use crate::cli::{Plan, Shell};
+use crate::export::{self, RunInfo};
 use crate::gate::{QUIET_LOAD, QUIET_WAIT_LIMIT_SECONDS, QuietWait, wait_for_quiet};
 use crate::powermetrics::{Powermetrics, START_LEAD_SECONDS, planned_sample_limit};
 use crate::preflight::{
@@ -308,22 +309,46 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
     let rows = measured?;
     let analysis = analyze_so_far(&power_path, &rows)?;
     let ended_at = timestamp(system)?;
+    let os_build = check.build.clone();
+    let hardware_model = hardware_model(&power_path);
     let meta = Meta {
         benchdown_version: env!("CARGO_PKG_VERSION").to_owned(),
         arguments: std::env::args().skip(1).collect(),
-        os_build: check.build.clone(),
-        hardware_model: hardware_model(&power_path),
+        os_build: os_build.clone(),
+        hardware_model: hardware_model.clone(),
         preflight: PreflightRecord {
             machine,
             powermetrics: check,
         },
-        started_at,
+        started_at: started_at.clone(),
         ended_at,
         extra_rounds,
         quiet_waits,
     };
     write_json(&meta_path, &meta)?;
     write_json(&analysis_path, &analysis)?;
+
+    if let Some(path) = &plan.export_json {
+        let workloads: Vec<(String, String)> = plan
+            .workloads
+            .iter()
+            .map(|workload| (workload.name.clone(), workload.command.clone()))
+            .collect();
+        let (os, architecture) = platform(system);
+        let export = export::build(
+            &analysis,
+            RunInfo {
+                workloads: &workloads,
+                started_at: &started_at,
+                os_build: &os_build,
+                hardware_model: &hardware_model,
+                os: &os,
+                architecture: &architecture,
+            },
+        )?;
+        export::write(path, &export)?;
+        println!("Exported: {}", path.display());
+    }
 
     println!();
     println!("{}", format_analysis(&analysis).join("\n"));
@@ -524,6 +549,28 @@ fn hardware_model(power_path: &Path) -> String {
         .and_then(|value| value.as_string())
         .map(str::to_owned)
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// The operating system and architecture hyperfine records in its metadata.
+fn platform(system: &System) -> (String, String) {
+    (
+        uname(system, "-s", std::env::consts::OS),
+        uname(system, "-m", std::env::consts::ARCH),
+    )
+}
+
+fn uname(system: &System, flag: &str, fallback: &str) -> String {
+    system
+        .runner
+        .capture(
+            &["uname".to_owned(), flag.to_owned()],
+            CaptureOptions::default(),
+        )
+        .ok()
+        .filter(|captured| captured.succeeded())
+        .map(|captured| captured.stdout.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {

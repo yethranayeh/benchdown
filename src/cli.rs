@@ -149,7 +149,7 @@ pub struct RunArgs {
     #[arg(long, value_name = "N", default_value_t = SCHEDULE_SEED)]
     pub seed: u32,
 
-    /// Write results to this file as JSON
+    /// Write the results as hyperfine-shaped JSON
     #[arg(long, value_name = "F")]
     pub export_json: Option<PathBuf>,
 
