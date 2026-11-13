@@ -45,55 +45,10 @@ fn run_help_lists_every_option() {
         "--settle",
         "--seed",
         "--export-json",
+        "--out",
         "--check",
     ] {
         assert!(help.contains(option), "{option} missing from run --help");
-    }
-}
-
-#[test]
-fn the_plan_shows_defaults() {
-    let output = benchdown(&["run", "echo hi"]);
-    assert!(output.status.success());
-    let plan = text(&output.stdout);
-    for line in [
-        "Rounds:     5",
-        "Idle block: 20s",
-        "Work block: 20s",
-        "Settle:     5s",
-        "Seed:       20261106",
-        "Total:      3m 45s for 5 blocks",
-    ] {
-        assert!(plan.contains(line), "{line} missing from the plan");
-    }
-}
-
-#[test]
-fn check_overrides_the_block_lengths_in_the_plan() {
-    let output = benchdown(&["run", "--check", "echo hi"]);
-    assert!(output.status.success());
-    let plan = text(&output.stdout);
-    assert!(plan.contains("Rounds:     1"), "{plan}");
-    assert!(plan.contains("Idle block: 5s"), "{plan}");
-    assert!(plan.contains("Work block: 5s"), "{plan}");
-    assert!(plan.contains("Settle:     2s"), "{plan}");
-    assert!(plan.contains("Total:      12s for 1 block"), "{plan}");
-}
-
-#[test]
-fn the_plan_lists_each_rounds_order() {
-    let output = benchdown(&["run", "-n", "a", "-n", "b", "one", "two"]);
-    assert!(output.status.success());
-    let plan = text(&output.stdout);
-    for line in [
-        "Round order",
-        "  Round 1: b, a",
-        "  Round 2: a, b",
-        "  Round 3: a, b",
-        "  Round 4: b, a",
-        "  Round 5: a, b",
-    ] {
-        assert!(plan.contains(line), "{line} missing from the plan");
     }
 }
 

@@ -22,6 +22,14 @@ pub struct PowerSample {
     pub seconds: f64,
 }
 
+/// Splits the NUL-separated plist stream and keeps the chunks that parse.
+pub fn parse_records(text: &str) -> Vec<plist::Value> {
+    text.split('\0')
+        .filter(|chunk| !chunk.trim().is_empty())
+        .filter_map(|chunk| plist::Value::from_reader_xml(chunk.as_bytes()).ok())
+        .collect()
+}
+
 /// Splits the NUL-separated plist stream and keeps usable samples.
 ///
 /// A sample is skipped when its plist does not parse, when `elapsed_ns`,
@@ -29,14 +37,13 @@ pub struct PowerSample {
 /// when `elapsed_ns` is not positive. The final chunk is often cut off when
 /// powermetrics stops; it does not parse and is skipped.
 pub fn parse_power_log(text: &str) -> Vec<PowerSample> {
-    text.split('\0').filter_map(parse_sample).collect()
+    parse_records(text)
+        .iter()
+        .filter_map(power_sample)
+        .collect()
 }
 
-fn parse_sample(chunk: &str) -> Option<PowerSample> {
-    if chunk.trim().is_empty() {
-        return None;
-    }
-    let value = plist::Value::from_reader_xml(chunk.as_bytes()).ok()?;
+fn power_sample(value: &plist::Value) -> Option<PowerSample> {
     let record = value.as_dictionary()?;
     let processor = record.get("processor")?.as_dictionary()?;
 
@@ -62,7 +69,7 @@ fn parse_sample(chunk: &str) -> Option<PowerSample> {
 }
 
 /// A plist number, whether it was written as an integer or a real.
-fn number(value: &plist::Value) -> Option<f64> {
+pub(crate) fn number(value: &plist::Value) -> Option<f64> {
     value.as_real().or_else(|| {
         value
             .as_signed_integer()

@@ -1,6 +1,5 @@
 //! The `benchdown` command line.
 
-use std::fmt;
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand, error::ErrorKind};
@@ -8,7 +7,6 @@ use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand, error::ErrorKin
 use crate::analysis;
 use crate::blocks;
 use crate::samples;
-use crate::schedule;
 
 /// Defaults follow Zinn's measurement harness, which benchdown's method comes from.
 pub const DEFAULT_ROUNDS: u64 = 5;
@@ -70,7 +68,7 @@ impl AnalyzeArgs {
         let block_log = read(&self.blocks)?;
         let samples = samples::parse_power_log(&power);
         let blocks = blocks::parse_blocks(&block_log)?;
-        let analysis = analysis::analyze(&samples, &blocks)?;
+        let analysis = analysis::analyze(&samples, &blocks, &[])?;
 
         if self.json {
             let json =
@@ -155,6 +153,10 @@ pub struct RunArgs {
     #[arg(long, value_name = "F")]
     pub export_json: Option<PathBuf>,
 
+    /// Folder for the run's files (default ./benchdown-<yyyymmdd-hhmmss>/)
+    #[arg(long, value_name = "DIR")]
+    pub out: Option<PathBuf>,
+
     /// Smoke run: one round of 5 s blocks with 2 s settle, overriding the block lengths
     #[arg(long)]
     pub check: bool,
@@ -189,6 +191,7 @@ pub struct Plan {
     pub settle_seconds: u64,
     pub seed: u32,
     pub export_json: Option<PathBuf>,
+    pub out: Option<PathBuf>,
 }
 
 impl Plan {
@@ -257,6 +260,7 @@ impl Plan {
             settle_seconds,
             seed: args.seed,
             export_json: args.export_json,
+            out: args.out,
         })
     }
 
@@ -273,89 +277,6 @@ impl Plan {
     /// Seconds the whole run plans for.
     pub fn total_seconds(&self) -> u64 {
         self.blocks() * self.seconds_per_block()
-    }
-
-    /// The order each round visits the workloads in.
-    pub fn round_orders(&self) -> Vec<Vec<String>> {
-        let names: Vec<&str> = self
-            .workloads
-            .iter()
-            .map(|workload| workload.name.as_str())
-            .collect();
-        schedule::round_orders(&names, self.rounds as usize, self.seed)
-    }
-}
-
-impl fmt::Display for Plan {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            formatter,
-            "benchdown {} — plan only, nothing is measured yet",
-            env!("CARGO_PKG_VERSION")
-        )?;
-        writeln!(formatter)?;
-        writeln!(formatter, "Workloads")?;
-        for (index, workload) in self.workloads.iter().enumerate() {
-            writeln!(formatter, "  {}. {}", index + 1, workload.name)?;
-            writeln!(formatter, "     command: {}", workload.command)?;
-            if let Some(prepare) = &workload.prepare {
-                writeln!(formatter, "     prepare: {prepare}")?;
-            }
-        }
-        writeln!(formatter)?;
-        writeln!(formatter, "Round order")?;
-        for (index, order) in self.round_orders().iter().enumerate() {
-            writeln!(formatter, "  Round {}: {}", index + 1, order.join(", "))?;
-        }
-        writeln!(formatter)?;
-        let shell = match &self.shell {
-            Shell::Program(program) => program.as_str(),
-            Shell::None => "none (split on whitespace)",
-        };
-        writeln!(formatter, "Shell:      {shell}")?;
-        writeln!(formatter, "Rounds:     {}", self.rounds)?;
-        writeln!(
-            formatter,
-            "Idle block: {}",
-            format_seconds(self.idle_seconds)
-        )?;
-        writeln!(
-            formatter,
-            "Work block: {}",
-            format_seconds(self.work_seconds)
-        )?;
-        writeln!(
-            formatter,
-            "Settle:     {}",
-            format_seconds(self.settle_seconds)
-        )?;
-        writeln!(formatter, "Seed:       {}", self.seed)?;
-        if let Some(path) = &self.export_json {
-            writeln!(formatter, "Export:     {}", path.display())?;
-        }
-        writeln!(
-            formatter,
-            "Total:      {} for {} {}",
-            format_seconds(self.total_seconds()),
-            self.blocks(),
-            if self.blocks() == 1 {
-                "block"
-            } else {
-                "blocks"
-            }
-        )
-    }
-}
-
-/// Seconds as `45s`, `7m 30s` or `1h 2m 3s`.
-pub fn format_seconds(total: u64) -> String {
-    let hours = total / 3_600;
-    let minutes = total % 3_600 / 60;
-    let seconds = total % 60;
-    match (hours, minutes) {
-        (0, 0) => format!("{seconds}s"),
-        (0, _) => format!("{minutes}m {seconds}s"),
-        _ => format!("{hours}h {minutes}m {seconds}s"),
     }
 }
 
@@ -428,6 +349,8 @@ mod tests {
             "7",
             "--export-json",
             "results.json",
+            "--out",
+            "somewhere",
             "cargo build",
             "cargo test",
         ])
@@ -443,6 +366,7 @@ mod tests {
             plan.export_json,
             Some(std::path::PathBuf::from("results.json"))
         );
+        assert_eq!(plan.out, Some(std::path::PathBuf::from("somewhere")));
         assert_eq!(plan.workloads.len(), 2);
         assert_eq!(plan.workloads[0].name, "first");
         assert_eq!(plan.workloads[0].prepare.as_deref(), Some("make clean"));
@@ -505,32 +429,8 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_schedules_every_round() {
-        let plan = plan(&["-n", "a", "-n", "b", "one", "two"]).expect("two named commands plan");
-        assert_eq!(
-            plan.round_orders(),
-            [["b", "a"], ["a", "b"], ["a", "b"], ["b", "a"], ["a", "b"],]
-        );
-    }
-
-    #[test]
-    fn a_check_run_still_schedules_its_one_round() {
-        let plan = plan(&["--check", "-n", "a", "-n", "b", "one", "two"]).expect("a check run");
-        assert_eq!(plan.round_orders(), [["b", "a"]]);
-    }
-
-    #[test]
     fn rounds_are_capped_so_a_plan_stays_printable() {
         let error = plan(&["--rounds", "20000", "one"]).expect_err("20000 rounds is refused");
         assert!(error.contains("20000"), "{error}");
-    }
-
-    #[test]
-    fn seconds_are_formatted_by_size() {
-        assert_eq!(format_seconds(0), "0s");
-        assert_eq!(format_seconds(45), "45s");
-        assert_eq!(format_seconds(60), "1m 0s");
-        assert_eq!(format_seconds(450), "7m 30s");
-        assert_eq!(format_seconds(3_723), "1h 2m 3s");
     }
 }

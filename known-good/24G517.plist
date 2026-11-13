@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>elapsed_ns</key>
+	<integer>504150000</integer>
+	<key>kern_osversion</key>
+	<string>24G517</string>
+	<key>timestamp</key>
+	<date>2026-11-08T18:18:03Z</date>
+	<key>processor</key>
+	<dict>
+		<key>combined_power</key>
+		<real>120.996</real>
+	</dict>
+</dict>
+</plist>

@@ -23,6 +23,10 @@ cargo install --path .
 benchdown run 'cargo build'
 ```
 
+A run needs `sudo` for `powermetrics`, a machine on AC power and 2 GB of free
+disk. It writes `power.plist`, `blocks.tsv`, `analysis.json` and `meta.json` to
+`./benchdown-<date>/`, or to `--out <dir>`.
+
 It reports whole-machine processor energy above an idle baseline, not the energy
 of one process.
 

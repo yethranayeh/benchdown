@@ -1,3 +1,6 @@
 /target
 
 .DS_Store
+
+# Run folders written by `benchdown run`
+benchdown-*/

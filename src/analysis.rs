@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 use crate::blocks::{BlockKind, BlockRow};
+use crate::gate::{ContaminatedBlock, ContaminationReason};
 use crate::samples::{PowerSample, mean_power_mw, samples_inside};
 
 /// Spread above this fraction means the figure is not stated.
@@ -73,6 +74,9 @@ pub struct BlockAnalysis {
     pub per_run_mj: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drop_reason: Option<DropReason>,
+    /// Set when the session samples showed background work during this block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contamination: Option<ContaminationReason>,
 }
 
 /// One command's energy across the rounds that measured it.
@@ -127,6 +131,9 @@ pub struct Analysis {
     pub blocks: Vec<BlockAnalysis>,
     pub workloads: Vec<WorkloadAnalysis>,
     pub dropped_blocks: Vec<DroppedBlock>,
+    /// Blocks the session samples marked as disturbed. Each one drops its round too.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contaminated_blocks: Vec<ContaminatedBlock>,
     pub dropped_rounds: Vec<u64>,
 }
 
@@ -143,7 +150,11 @@ struct WorkPair {
 }
 
 /// Turns samples and block rows into energy per run, dropping disturbed rounds.
-pub fn analyze(samples: &[PowerSample], blocks: &[BlockRow]) -> Result<Analysis, String> {
+pub fn analyze(
+    samples: &[PowerSample],
+    blocks: &[BlockRow],
+    contaminated: &[ContaminatedBlock],
+) -> Result<Analysis, String> {
     if samples.is_empty() {
         return Err("no usable samples: processor.combined_power missing from the log".to_owned());
     }
@@ -169,6 +180,7 @@ pub fn analyze(samples: &[PowerSample], blocks: &[BlockRow]) -> Result<Analysis,
     let dropped = find_dropped_blocks(blocks, &analyses, &workload_medians);
     let dropped_rounds: Vec<u64> = {
         let mut rounds: Vec<u64> = dropped.iter().map(|entry| entry.round).collect();
+        rounds.extend(contaminated.iter().map(|entry| entry.round));
         rounds.sort_unstable();
         rounds.dedup();
         rounds
@@ -176,10 +188,17 @@ pub fn analyze(samples: &[PowerSample], blocks: &[BlockRow]) -> Result<Analysis,
 
     for block in &mut analyses {
         block.dropped = dropped_rounds.contains(&block.round);
-        if let Some(entry) = dropped.iter().find(|entry| {
-            entry.round == block.round && entry.label == block.label && entry.kind == block.kind
-        }) {
+        if let Some(entry) = dropped
+            .iter()
+            .find(|entry| is_same_block(entry.round, &entry.label, entry.kind, block))
+        {
             block.drop_reason = Some(entry.reason);
+        }
+        if let Some(entry) = contaminated
+            .iter()
+            .find(|entry| is_same_block(entry.round, &entry.label, entry.kind, block))
+        {
+            block.contamination = Some(entry.reason);
         }
     }
 
@@ -195,8 +214,23 @@ pub fn analyze(samples: &[PowerSample], blocks: &[BlockRow]) -> Result<Analysis,
         blocks: analyses,
         workloads,
         dropped_blocks: dropped,
+        contaminated_blocks: contaminated.to_vec(),
         dropped_rounds,
     })
+}
+
+/// Labels of the workloads that need more clean rounds, in analysis order.
+pub fn workloads_short_of_clean_rounds(analysis: &Analysis) -> Vec<String> {
+    analysis
+        .workloads
+        .iter()
+        .filter(|workload| workload.clean_verdict == CleanVerdict::Rerun)
+        .map(|workload| workload.label.clone())
+        .collect()
+}
+
+fn is_same_block(round: u64, label: &str, kind: BlockKind, block: &BlockAnalysis) -> bool {
+    round == block.round && label == block.label && kind == block.kind
 }
 
 fn base_analysis(block: &BlockRow) -> BlockAnalysis {
@@ -216,6 +250,7 @@ fn base_analysis(block: &BlockRow) -> BlockAnalysis {
         net_mj: None,
         per_run_mj: None,
         drop_reason: None,
+        contamination: None,
     }
 }
 
@@ -480,6 +515,7 @@ pub fn format_analysis(analysis: &Analysis) -> Vec<String> {
     ));
     lines.push(String::new());
     lines.push(format_dropped(&analysis.dropped_blocks));
+    lines.push(format_contaminated(&analysis.contaminated_blocks));
     lines.push(String::new());
     lines.push(
         [
@@ -532,6 +568,33 @@ fn format_dropped(dropped: &[DroppedBlock]) -> String {
             entry.kind.as_str(),
             entry.observed_mw,
             limit
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_contaminated(contaminated: &[ContaminatedBlock]) -> String {
+    if contaminated.is_empty() {
+        return "contaminated blocks: none".to_owned();
+    }
+    let mut lines = vec![format!("contaminated blocks: {}", contaminated.len())];
+    for entry in contaminated {
+        let cause = match entry.reason {
+            ContaminationReason::Load => {
+                format!("load {}, limit {}", entry.observed, entry.limit)
+            }
+            ContaminationReason::Process => format!(
+                "{} at {}% CPU, limit {}%",
+                entry.process.as_deref().unwrap_or("a background process"),
+                entry.observed,
+                entry.limit
+            ),
+        };
+        lines.push(format!(
+            "  round {} {} ({}): {cause}",
+            entry.round,
+            entry.label,
+            entry.kind.as_str()
         ));
     }
     lines.join("\n")
@@ -640,6 +703,13 @@ mod tests {
     }
 
     fn analyze_rounds(rounds: &[(u64, f64, f64)]) -> Analysis {
+        analyze_rounds_with(rounds, &[])
+    }
+
+    fn analyze_rounds_with(
+        rounds: &[(u64, f64, f64)],
+        contaminated: &[ContaminatedBlock],
+    ) -> Analysis {
         let mut samples = Vec::new();
         let mut blocks = Vec::new();
         for (round, idle_power, work_power) in rounds {
@@ -654,13 +724,13 @@ mod tests {
             samples.extend(round_samples);
             blocks.extend(round_blocks);
         }
-        analyze(&samples, &blocks).expect("the run analyzes")
+        analyze(&samples, &blocks, contaminated).expect("the run analyzes")
     }
 
     #[test]
     fn energy_per_command_subtracts_idle_power_and_divides_by_the_run_count() {
         let (samples, blocks) = pair(1, "x", 0.0, 500.0, 1_500.0, 100);
-        let analysis = analyze(&samples, &blocks).expect("the run analyzes");
+        let analysis = analyze(&samples, &blocks, &[]).expect("the run analyzes");
         assert_eq!(analysis.idle_median_mw, 500.0);
         assert_eq!(analysis.workloads.len(), 1);
 
@@ -759,10 +829,53 @@ mod tests {
     }
 
     #[test]
+    fn a_contaminated_block_drops_its_round() {
+        let rounds: Vec<(u64, f64, f64)> = (1..=5).map(|round| (round, 400.0, 1_000.0)).collect();
+        let contaminated = [ContaminatedBlock {
+            round: 2,
+            label: "x".to_owned(),
+            kind: BlockKind::Work,
+            reason: ContaminationReason::Load,
+            observed: 4.4,
+            limit: 3.5,
+            process: None,
+        }];
+        let analysis = analyze_rounds_with(&rounds, &contaminated);
+
+        assert_eq!(analysis.dropped_rounds, [2]);
+        assert_eq!(analysis.contaminated_blocks.len(), 1);
+        assert_eq!(analysis.workloads[0].clean_rounds, 4);
+        let work = analysis
+            .blocks
+            .iter()
+            .find(|block| block.round == 2 && block.kind == BlockKind::Work)
+            .expect("the work block is there");
+        assert_eq!(work.contamination, Some(ContaminationReason::Load));
+        assert!(work.dropped);
+    }
+
+    #[test]
+    fn workloads_short_of_clean_rounds_names_the_reruns() {
+        let clean: Vec<(u64, f64, f64)> = (1..=5).map(|round| (round, 400.0, 1_000.0)).collect();
+        assert!(workloads_short_of_clean_rounds(&analyze_rounds(&clean)).is_empty());
+
+        let short: Vec<(u64, f64, f64)> = (1..=5)
+            .map(|round| {
+                let idle = if round >= 4 { 2_000.0 } else { 400.0 };
+                (round, idle, 1_000.0)
+            })
+            .collect();
+        assert_eq!(
+            workloads_short_of_clean_rounds(&analyze_rounds(&short)),
+            ["x"]
+        );
+    }
+
+    #[test]
     fn a_work_block_without_an_idle_before_it_is_skipped() {
         let samples = seconds_of(0.0, 10, 1_000.0);
         let blocks = [work(1, "x", 0.0, 10.0, 10)];
-        let error = analyze(&samples, &blocks).expect_err("nothing pairs");
+        let error = analyze(&samples, &blocks, &[]).expect_err("nothing pairs");
         assert_eq!(error, "no work block has samples: nothing to analyze");
     }
 
@@ -770,13 +883,13 @@ mod tests {
     fn a_work_block_counts_no_commands() {
         let (samples, mut blocks) = pair(1, "x", 0.0, 500.0, 1_500.0, 0);
         blocks[1].count = 0;
-        let error = analyze(&samples, &blocks).expect_err("no run count");
+        let error = analyze(&samples, &blocks, &[]).expect_err("no run count");
         assert_eq!(error, "Block 1 x ran no commands");
     }
 
     #[test]
     fn no_samples_is_refused() {
-        let error = analyze(&[], &[work(1, "x", 0.0, 10.0, 10)]).expect_err("no samples");
+        let error = analyze(&[], &[work(1, "x", 0.0, 10.0, 10)], &[]).expect_err("no samples");
         assert!(error.starts_with("no usable samples"), "{error}");
     }
 
@@ -792,7 +905,7 @@ mod tests {
             crate::samples::parse_power_log(include_str!("../tests/fixtures/power.plist"));
         let blocks = crate::blocks::parse_blocks(include_str!("../tests/fixtures/blocks.tsv"))
             .expect("the fixture block log parses");
-        let analysis = analyze(&samples, &blocks).expect("the fixture analyzes");
+        let analysis = analyze(&samples, &blocks, &[]).expect("the fixture analyzes");
 
         // Idle is 115 mW for four seconds, work is 155 mW for four seconds, so the
         // work block carries 620 mJ, 460 mJ of which the idle block explains.
