@@ -10,7 +10,7 @@ use crate::analysis::{
     Analysis, MINIMUM_CLEAN_ROUNDS, analyze, format_analysis, workloads_short_of_clean_rounds,
 };
 use crate::blocks::{BlockKind, BlockRow, format_header, format_row};
-use crate::cli::{Plan, Shell};
+use crate::cli::{Plan, Shell, format_seconds};
 use crate::export::{self, RunInfo};
 use crate::gate::{QUIET_LOAD, QUIET_WAIT_LIMIT_SECONDS, QuietWait, wait_for_quiet};
 use crate::powermetrics::{Powermetrics, START_LEAD_SECONDS, planned_sample_limit};
@@ -186,6 +186,7 @@ struct PreflightRecord {
 
 /// Measures the plan and writes its output folder.
 pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
+    let started_ms = system.clock.now_ms();
     let directory = match &plan.out {
         Some(directory) => directory.clone(),
         None => default_output_directory(system)?,
@@ -221,7 +222,9 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
         + most_blocks * QUIET_WAIT_LIMIT_SECONDS;
     let sample_limit = planned_sample_limit(longest_seconds);
     println!(
-        "Plan:   {planned_seconds}s of blocks, at most {longest_seconds}s with extra rounds and quiet waits"
+        "Plan:   {} of blocks, at most {} with extra rounds and quiet waits",
+        format_seconds(planned_seconds),
+        format_seconds(longest_seconds)
     );
     println!("        powermetrics stops by itself after {sample_limit} samples");
 
@@ -353,6 +356,9 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
     println!();
     println!("{}", format_analysis(&analysis).join("\n"));
     println!();
+    let elapsed_seconds =
+        system.clock.now_ms().saturating_sub(started_ms) / MILLISECONDS_PER_SECOND;
+    println!("Total: {}", format_seconds(elapsed_seconds));
     Ok(())
 }
 

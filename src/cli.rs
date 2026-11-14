@@ -280,6 +280,18 @@ impl Plan {
     }
 }
 
+/// Seconds as `45s`, `7m 30s` or `1h 2m 3s`.
+pub fn format_seconds(total: u64) -> String {
+    let hours = total / 3_600;
+    let minutes = total % 3_600 / 60;
+    let seconds = total % 60;
+    match (hours, minutes) {
+        (0, 0) => format!("{seconds}s"),
+        (0, _) => format!("{minutes}m {seconds}s"),
+        _ => format!("{hours}h {minutes}m {seconds}s"),
+    }
+}
+
 /// Prints a refused command line and exits with clap's usage-error status.
 pub fn exit_with(message: &str) -> ! {
     let mut command = Args::command();
@@ -426,6 +438,15 @@ mod tests {
         assert_eq!(plan.blocks(), 10);
         assert_eq!(plan.seconds_per_block(), 45);
         assert_eq!(plan.total_seconds(), 450);
+    }
+
+    #[test]
+    fn seconds_are_formatted_by_size() {
+        assert_eq!(format_seconds(0), "0s");
+        assert_eq!(format_seconds(45), "45s");
+        assert_eq!(format_seconds(60), "1m 0s");
+        assert_eq!(format_seconds(450), "7m 30s");
+        assert_eq!(format_seconds(3_723), "1h 2m 3s");
     }
 
     #[test]
