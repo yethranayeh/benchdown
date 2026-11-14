@@ -96,7 +96,8 @@ pub struct RunArgs {
     #[arg(short = 'n', long = "command-name", value_name = "N")]
     pub command_names: Vec<String>,
 
-    /// Shell that runs each command; `none` splits it on whitespace and runs it directly
+    /// Shell that runs each command; `none` splits it into words with quotes and
+    /// backslashes, and runs it directly without expanding or interpreting anything
     #[arg(
         short = 'S',
         long,
@@ -113,6 +114,18 @@ pub struct RunArgs {
     /// Command to run before each work block; one per command, or one for all
     #[arg(short = 'p', long, value_name = "CMD")]
     pub prepare: Vec<String>,
+
+    /// Directory the measured commands run in
+    #[arg(long, value_name = "DIR")]
+    pub cwd: Option<PathBuf>,
+
+    /// Add KEY=VALUE to the measured commands' environment; repeatable
+    #[arg(long, value_name = "KEY=VALUE", value_parser = parse_env_var)]
+    pub env: Vec<(String, String)>,
+
+    /// Start the measured commands with an empty environment
+    #[arg(long)]
+    pub env_clear: bool,
 
     /// Rounds over the workloads, at most 10000
     #[arg(
@@ -167,7 +180,9 @@ pub struct RunArgs {
 pub enum Shell {
     /// Run the command through this shell.
     Program(String),
-    /// Split the command on whitespace and run it directly.
+    /// Split the command into shell words: quotes group and protect characters
+    /// and a backslash escapes the next one, but nothing is expanded and no
+    /// operator is interpreted.
     None,
 }
 
@@ -192,6 +207,12 @@ pub struct Plan {
     pub seed: u32,
     pub export_json: Option<PathBuf>,
     pub out: Option<PathBuf>,
+    /// Directory the measured commands run in.
+    pub cwd: Option<PathBuf>,
+    /// Variables added to the measured commands' environment, one per key.
+    pub env: Vec<(String, String)>,
+    /// Start the measured commands with an empty environment, then add `env`.
+    pub env_clear: bool,
 }
 
 impl Plan {
@@ -225,20 +246,39 @@ impl Plan {
             .commands
             .into_iter()
             .enumerate()
-            .map(|(index, command)| Workload {
-                name: args
+            .map(|(index, command)| {
+                let name = args
                     .command_names
                     .get(index)
                     .cloned()
-                    .unwrap_or_else(|| command.clone()),
-                command,
-                prepare: match args.prepare.len() {
+                    .unwrap_or_else(|| command.clone());
+                let prepare = match args.prepare.len() {
                     0 => None,
                     1 => args.prepare.first().cloned(),
                     _ => args.prepare.get(index).cloned(),
-                },
+                };
+                // Resolve every string now, so a command the splitter cannot read
+                // is a usage error rather than a failure after preflight.
+                command_argv(&shell, &command).map_err(|error| format!("{name}: {error}"))?;
+                if let Some(prepare) = &prepare {
+                    command_argv(&shell, prepare)
+                        .map_err(|error| format!("{name}: prepare {error}"))?;
+                }
+                Ok(Workload {
+                    name,
+                    command,
+                    prepare,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut env: Vec<(String, String)> = Vec::new();
+        for (key, value) in args.env {
+            match env.iter_mut().find(|(existing, _)| *existing == key) {
+                Some(entry) => entry.1 = value,
+                None => env.push((key, value)),
+            }
+        }
 
         let (rounds, idle_seconds, work_seconds, settle_seconds) = if args.check {
             (
@@ -261,6 +301,9 @@ impl Plan {
             seed: args.seed,
             export_json: args.export_json,
             out: args.out,
+            cwd: args.cwd,
+            env,
+            env_clear: args.env_clear,
         })
     }
 
@@ -277,6 +320,55 @@ impl Plan {
     /// Seconds the whole run plans for.
     pub fn total_seconds(&self) -> u64 {
         self.blocks() * self.seconds_per_block()
+    }
+}
+
+/// Splits one `--env KEY=VALUE` argument into its name and value.
+fn parse_env_var(text: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = text.split_once('=') else {
+        return Err(format!(
+            "{text} is not KEY=VALUE: pass a variable name and a value joined by ="
+        ));
+    };
+    if key.is_empty() {
+        return Err(format!(
+            "{text} has no variable name: pass KEY=VALUE with a name before the ="
+        ));
+    }
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+/// The argv that runs one command under a shell rule.
+///
+/// A shell gets the command string unchanged as its `-c` argument. Without a
+/// shell the string is split into words: quotes group and protect characters and
+/// a backslash escapes the next one, but nothing is expanded and no operator is
+/// interpreted.
+pub fn command_argv(shell: &Shell, command: &str) -> Result<Vec<String>, String> {
+    match shell {
+        Shell::Program(program) => Ok(vec![program.clone(), "-c".to_owned(), command.to_owned()]),
+        Shell::None => {
+            // shell-words keeps a trailing backslash as a literal character, but
+            // an escape with nothing left to escape is a typo the user should see.
+            if command
+                .chars()
+                .rev()
+                .take_while(|character| *character == '\\')
+                .count()
+                % 2
+                == 1
+            {
+                return Err(format!(
+                    "cannot split {command:?} into an argv: trailing backslash"
+                ));
+            }
+            let argv = shell_words::split(command)
+                .map_err(|error| format!("cannot split {command:?} into an argv: {error}"))?;
+            if argv.is_empty() {
+                return Err(format!("{command:?} has no command to run"));
+            }
+            Ok(argv)
+        }
     }
 }
 
@@ -331,9 +423,67 @@ mod tests {
         assert_eq!(plan.seed, SCHEDULE_SEED);
         assert_eq!(plan.shell, Shell::Program("sh".to_owned()));
         assert_eq!(plan.export_json, None);
+        assert_eq!(plan.cwd, None);
+        assert!(plan.env.is_empty());
+        assert!(!plan.env_clear);
         assert_eq!(plan.workloads.len(), 1);
         assert_eq!(plan.workloads[0].name, "echo hi");
         assert_eq!(plan.workloads[0].prepare, None);
+    }
+
+    #[test]
+    fn cwd_and_environment_reach_the_plan() {
+        let plan = plan(&[
+            "--cwd",
+            "/tmp/work",
+            "--env",
+            "A=1",
+            "--env",
+            "EMPTY=",
+            "--env",
+            "PAIR=a=b",
+            "--env-clear",
+            "true",
+        ])
+        .expect("the directory and environment parse");
+
+        assert_eq!(plan.cwd, Some(PathBuf::from("/tmp/work")));
+        assert_eq!(
+            plan.env,
+            [
+                ("A".to_owned(), "1".to_owned()),
+                ("EMPTY".to_owned(), String::new()),
+                ("PAIR".to_owned(), "a=b".to_owned()),
+            ]
+        );
+        assert!(plan.env_clear);
+    }
+
+    #[test]
+    fn the_last_env_value_for_a_key_wins() {
+        let plan = plan(&["--env", "A=1", "--env", "B=2", "--env", "A=3", "true"])
+            .expect("a repeated key parses");
+        assert_eq!(
+            plan.env,
+            [
+                ("A".to_owned(), "3".to_owned()),
+                ("B".to_owned(), "2".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn an_env_without_an_equals_sign_is_refused() {
+        let error = plan(&["--env", "NOVALUE", "true"]).expect_err("there is no value");
+        assert!(error.contains("KEY=VALUE"), "{error}");
+        assert!(error.contains("NOVALUE"), "{error}");
+    }
+
+    #[test]
+    fn an_env_with_an_empty_key_is_refused() {
+        let error = plan(&["--env", "=VALUE", "true"]).expect_err("there is no name");
+        assert!(error.contains("KEY=VALUE"), "{error}");
+        assert!(error.contains("=VALUE"), "{error}");
     }
 
     #[test]
@@ -349,6 +499,10 @@ mod tests {
             "make clean",
             "-p",
             "make",
+            "--cwd",
+            "elsewhere",
+            "--env",
+            "X=1",
             "--rounds",
             "2",
             "--idle",
@@ -379,6 +533,9 @@ mod tests {
             Some(std::path::PathBuf::from("results.json"))
         );
         assert_eq!(plan.out, Some(std::path::PathBuf::from("somewhere")));
+        assert_eq!(plan.cwd, Some(std::path::PathBuf::from("elsewhere")));
+        assert_eq!(plan.env, [("X".to_owned(), "1".to_owned())]);
+        assert!(!plan.env_clear);
         assert_eq!(plan.workloads.len(), 2);
         assert_eq!(plan.workloads[0].name, "first");
         assert_eq!(plan.workloads[0].prepare.as_deref(), Some("make clean"));
@@ -402,6 +559,69 @@ mod tests {
         assert_eq!(spelled_out.shell, Shell::None);
         let short = plan(&["-N", "echo hi"]).expect("-N parses");
         assert_eq!(short.shell, Shell::None);
+    }
+
+    #[test]
+    fn shell_none_still_splits_on_whitespace() {
+        assert_eq!(
+            command_argv(&Shell::None, "echo  hi").expect("the words split"),
+            ["echo", "hi"]
+        );
+    }
+
+    #[test]
+    fn shell_none_keeps_quoted_arguments_together() {
+        assert_eq!(
+            command_argv(&Shell::None, "echo 'a b' c").expect("the words split"),
+            ["echo", "a b", "c"]
+        );
+        assert_eq!(
+            command_argv(&Shell::None, "echo \"a b\"").expect("the words split"),
+            ["echo", "a b"]
+        );
+        assert_eq!(
+            command_argv(&Shell::None, "echo a\\ b").expect("the words split"),
+            ["echo", "a b"]
+        );
+    }
+
+    #[test]
+    fn shell_none_refuses_a_string_it_cannot_split() {
+        for command in ["echo 'unterminated", "echo trailing\\"] {
+            let error =
+                command_argv(&Shell::None, command).expect_err("this string cannot be split");
+            assert!(error.contains(command), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_command_that_cannot_split_names_the_workload() {
+        let error = plan(&["-n", "quoted", "-N", "echo 'unterminated"])
+            .expect_err("the command cannot be split");
+        assert!(error.contains("quoted"), "{error}");
+        assert!(error.contains("echo 'unterminated"), "{error}");
+    }
+
+    #[test]
+    fn a_prepare_command_that_cannot_split_is_refused() {
+        let error = plan(&["-N", "-p", "echo 'unterminated", "true"])
+            .expect_err("the prepare cannot be split");
+        assert!(error.contains("prepare"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_shell_none_command_is_refused() {
+        let error = plan(&["-N", "   "]).expect_err("there is nothing to run");
+        assert!(error.contains("no command to run"), "{error}");
+    }
+
+    #[test]
+    fn a_shell_command_passes_the_string_unchanged() {
+        let command = "echo 'a b' | wc -l && true";
+        assert_eq!(
+            command_argv(&Shell::Program("sh".to_owned()), command).expect("a shell command runs"),
+            ["sh", "-c", command]
+        );
     }
 
     #[test]

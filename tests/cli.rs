@@ -39,6 +39,9 @@ fn run_help_lists_every_option() {
         "--command-name",
         "--shell",
         "--prepare",
+        "--cwd",
+        "--env",
+        "--env-clear",
         "--rounds",
         "--idle",
         "--work",
@@ -57,6 +60,26 @@ fn a_name_count_that_does_not_match_exits_two() {
     let output = benchdown(&["run", "-n", "only", "one", "two"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(text(&output.stderr).contains("command names"));
+}
+
+#[test]
+fn an_unterminated_quote_exits_two_before_the_run() {
+    let output = benchdown(&["run", "-N", "echo 'unterminated"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("Usage:"), "{stderr}");
+    assert!(stderr.contains("echo 'unterminated"), "{stderr}");
+
+    let stdout = text(&output.stdout);
+    assert!(!stdout.contains("Results:"), "{stdout}");
+    assert!(!stdout.contains("Plan:"), "{stdout}");
+}
+
+#[test]
+fn an_env_without_a_value_exits_two() {
+    let output = benchdown(&["run", "--env", "NOVALUE", "true"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("KEY=VALUE"));
 }
 
 #[test]

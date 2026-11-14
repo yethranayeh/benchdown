@@ -29,6 +29,17 @@ disk. It writes `power.plist`, `blocks.tsv`, `analysis.json` and `meta.json` to
 
 `--export-json <file>` writes the results as hyperfine-shaped JSON (schema version 2).
 
+`--cwd <dir>` runs the measured commands in another directory. `--env KEY=VALUE`
+(repeatable, last value wins) adds variables to their environment, and
+`--env-clear` starts them with an empty environment before `--env` entries are
+added. All three apply to measured commands only, not to `--prepare` commands.
+
+`--shell=none` (or `-N`) runs each command directly instead of through a shell.
+It splits the string into words with quotes and backslashes, so
+`task create --title 'two words'` keeps its title as one argument, but it does
+not expand variables or interpret pipes, redirections or other shell operators.
+A string it cannot split is refused before the run starts.
+
 It reports whole-machine processor energy above an idle baseline, not the energy
 of one process.
 

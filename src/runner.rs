@@ -24,6 +24,10 @@ impl Captured {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CaptureOptions<'a> {
     pub cwd: Option<&'a Path>,
+    /// Variables added to the command's environment, in order.
+    pub env: &'a [(String, String)],
+    /// Start the command with an empty environment, then add `env`.
+    pub clear_env: bool,
     /// Send stdout to /dev/null instead of buffering it, for a command run in a tight loop.
     pub discard_stdout: bool,
 }
@@ -59,6 +63,10 @@ impl Runner for SystemRunner {
         if let Some(directory) = options.cwd {
             command.current_dir(directory);
         }
+        if options.clear_env {
+            command.env_clear();
+        }
+        command.envs(options.env.iter().map(|(key, value)| (key, value)));
 
         let output = command
             .output()
@@ -147,10 +155,22 @@ pub fn temporary_path(name: &str) -> PathBuf {
 #[cfg(test)]
 type Responder = Box<dyn FnMut(&[String]) -> Captured + Send>;
 
+/// What one captured command was run with, owned so a test can assert on it.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedCapture {
+    pub argv: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+    pub clear_env: bool,
+    pub discard_stdout: bool,
+}
+
 /// A runner that records every command and answers from a script, for tests.
 #[cfg(test)]
 pub struct FakeRunner {
     pub argv: std::sync::Mutex<Vec<Vec<String>>>,
+    pub captures: std::sync::Mutex<Vec<RecordedCapture>>,
     pub spawned: std::sync::Mutex<Vec<Vec<String>>>,
     pub clock: Option<Arc<crate::clock::FakeClock>>,
     /// How long each captured command takes on the fake clock.
@@ -164,6 +184,7 @@ impl FakeRunner {
     pub fn new(respond: impl FnMut(&[String]) -> Captured + Send + 'static) -> Self {
         Self {
             argv: std::sync::Mutex::new(Vec::new()),
+            captures: std::sync::Mutex::new(Vec::new()),
             spawned: std::sync::Mutex::new(Vec::new()),
             clock: None,
             command_ms: 0,
@@ -192,15 +213,32 @@ impl FakeRunner {
             .expect("the record is not poisoned")
             .clone()
     }
+
+    pub fn captures(&self) -> Vec<RecordedCapture> {
+        self.captures
+            .lock()
+            .expect("the record is not poisoned")
+            .clone()
+    }
 }
 
 #[cfg(test)]
 impl Runner for FakeRunner {
-    fn capture(&self, argv: &[String], _options: CaptureOptions<'_>) -> Result<Captured, String> {
+    fn capture(&self, argv: &[String], options: CaptureOptions<'_>) -> Result<Captured, String> {
         self.argv
             .lock()
             .expect("the record is not poisoned")
             .push(argv.to_vec());
+        self.captures
+            .lock()
+            .expect("the record is not poisoned")
+            .push(RecordedCapture {
+                argv: argv.to_vec(),
+                cwd: options.cwd.map(Path::to_path_buf),
+                env: options.env.to_vec(),
+                clear_env: options.clear_env,
+                discard_stdout: options.discard_stdout,
+            });
         if let Some(clock) = &self.clock {
             clock.advance(self.command_ms);
         }

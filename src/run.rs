@@ -10,7 +10,7 @@ use crate::analysis::{
     Analysis, MINIMUM_CLEAN_ROUNDS, analyze, format_analysis, workloads_short_of_clean_rounds,
 };
 use crate::blocks::{BlockKind, BlockRow, format_header, format_row};
-use crate::cli::{Plan, Shell, format_seconds};
+use crate::cli::{Plan, command_argv, format_seconds};
 use crate::export::{self, RunInfo};
 use crate::gate::{QUIET_LOAD, QUIET_WAIT_LIMIT_SECONDS, QuietWait, wait_for_quiet};
 use crate::powermetrics::{Powermetrics, START_LEAD_SECONDS, planned_sample_limit};
@@ -56,6 +56,12 @@ pub struct BlockOptions<'a> {
     pub settle_seconds: u64,
     pub idle_seconds: u64,
     pub work_seconds: u64,
+    /// Directory the measured commands run in.
+    pub cwd: Option<&'a Path>,
+    /// Variables added to the measured commands' environment.
+    pub env: &'a [(String, String)],
+    /// Start the measured commands with an empty environment, then add `env`.
+    pub env_clear: bool,
     /// Runs before each block's prepare, such as a wait for a quiet machine.
     pub before_block: &'a mut dyn FnMut(u64, &str) -> Result<(), String>,
     pub on_block: &'a mut dyn FnMut(&BlockRow) -> Result<(), String>,
@@ -123,7 +129,9 @@ pub fn run_blocks(options: BlockOptions<'_>) -> Result<Vec<BlockRow>, String> {
                 let result = runner.capture(
                     &workload.argv,
                     CaptureOptions {
-                        cwd: None,
+                        cwd: options.cwd,
+                        env: options.env,
+                        clear_env: options.env_clear,
                         discard_stdout: true,
                     },
                 )?;
@@ -382,6 +390,9 @@ fn run_rounds(
         settle_seconds: plan.settle_seconds,
         idle_seconds: plan.idle_seconds,
         work_seconds: plan.work_seconds,
+        cwd: plan.cwd.as_deref(),
+        env: &plan.env,
+        env_clear: plan.env_clear,
         before_block: &mut |round, label| {
             let wait = wait_for_quiet(round, label, &mut load_reader(system), &|milliseconds| {
                 system.clock.sleep_ms(milliseconds)
@@ -460,20 +471,16 @@ fn build_workloads(plan: &Plan) -> Result<Vec<Workload>, String> {
     plan.workloads
         .iter()
         .map(|workload| {
-            let argv = command_argv(&plan.shell, &workload.command);
-            if argv.is_empty() {
-                return Err(format!(
-                    "{} has no command to run: --shell=none splits it on whitespace",
-                    workload.name
-                ));
-            }
             Ok(Workload {
                 label: workload.name.clone(),
-                argv,
+                argv: command_argv(&plan.shell, &workload.command)
+                    .map_err(|error| format!("{}: {error}", workload.name))?,
                 prepare: workload
                     .prepare
                     .as_ref()
-                    .map(|prepare| command_argv(&plan.shell, prepare)),
+                    .map(|prepare| command_argv(&plan.shell, prepare))
+                    .transpose()
+                    .map_err(|error| format!("{}: prepare {error}", workload.name))?,
             })
         })
         .collect()
@@ -484,13 +491,6 @@ fn workload_labels(workloads: &[Workload]) -> Vec<String> {
         .iter()
         .map(|workload| workload.label.clone())
         .collect()
-}
-
-fn command_argv(shell: &Shell, command: &str) -> Vec<String> {
-    match shell {
-        Shell::Program(program) => vec![program.clone(), "-c".to_owned(), command.to_owned()],
-        Shell::None => command.split_whitespace().map(str::to_owned).collect(),
-    }
 }
 
 fn install_signal_handlers(power: Arc<Powermetrics>) -> Result<(), String> {
@@ -623,6 +623,9 @@ mod tests {
             settle_seconds: 1,
             idle_seconds: 2,
             work_seconds: 3,
+            cwd: None,
+            env: &[],
+            env_clear: false,
             before_block: &mut |_, _| Ok(()),
             on_block: &mut |row| {
                 observed.push(row.clone());
@@ -674,6 +677,9 @@ mod tests {
             settle_seconds: 1,
             idle_seconds: 1,
             work_seconds: 1,
+            cwd: None,
+            env: &[],
+            env_clear: false,
             before_block: &mut |_, _| Ok(()),
             on_block: &mut |_| Ok(()),
         })
@@ -703,6 +709,9 @@ mod tests {
             settle_seconds: 0,
             idle_seconds: 0,
             work_seconds: 1,
+            cwd: None,
+            env: &[],
+            env_clear: false,
             before_block: &mut |_, _| Ok(()),
             on_block: &mut |_| Ok(()),
         })
@@ -713,16 +722,94 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_command_runs_through_the_shell() {
-        assert_eq!(
-            command_argv(&Shell::Program("sh".to_owned()), "echo hi"),
-            ["sh", "-c", "echo hi"]
+    fn a_measured_command_gets_the_cwd_and_environment_but_prepare_does_not() {
+        let clock = Arc::new(FakeClock::new(0));
+        let runner = Arc::new(FakeRunner::always(0).with_clock(Arc::clone(&clock), 500));
+        let system = System {
+            runner: runner.clone(),
+            clock,
+        };
+        let workloads = [Workload {
+            label: "x".to_owned(),
+            argv: vec!["true".to_owned()],
+            prepare: Some(vec!["true".to_owned()]),
+        }];
+        let orders = orders();
+        let cwd = Path::new("/measured");
+        let env = [
+            ("PATH".to_owned(), "/bin".to_owned()),
+            ("HOME".to_owned(), "/home/user".to_owned()),
+        ];
+
+        run_blocks(BlockOptions {
+            system: &system,
+            workloads: &workloads,
+            orders: &orders,
+            first_round: 1,
+            settle_seconds: 0,
+            idle_seconds: 0,
+            work_seconds: 1,
+            cwd: Some(cwd),
+            env: &env,
+            env_clear: false,
+            before_block: &mut |_, _| Ok(()),
+            on_block: &mut |_| Ok(()),
+        })
+        .expect("the round runs");
+
+        let captures = runner.captures();
+        assert_eq!(captures.len(), 3, "one prepare and two measured runs");
+        let prepare = &captures[0];
+        assert_eq!(prepare.argv, ["true"]);
+        assert_eq!(prepare.cwd, None, "prepare keeps benchdown's directory");
+        assert!(
+            prepare.env.is_empty(),
+            "prepare keeps benchdown's environment"
         );
+        assert!(!prepare.clear_env);
+        assert!(!prepare.discard_stdout);
+
+        for measured in &captures[1..] {
+            assert_eq!(measured.cwd.as_deref(), Some(cwd));
+            assert_eq!(measured.env, env);
+            assert!(!measured.clear_env);
+            assert!(measured.discard_stdout);
+        }
     }
 
     #[test]
-    fn a_shell_none_command_splits_on_whitespace() {
-        assert_eq!(command_argv(&Shell::None, "echo  hi"), ["echo", "hi"]);
-        assert!(command_argv(&Shell::None, "   ").is_empty());
+    fn clearing_the_environment_records_exactly_the_listed_variables() {
+        let clock = Arc::new(FakeClock::new(0));
+        let runner = Arc::new(FakeRunner::always(0).with_clock(Arc::clone(&clock), 500));
+        let system = System {
+            runner: runner.clone(),
+            clock,
+        };
+        let workloads = [workload()];
+        let orders = orders();
+        let env = [("ONLY".to_owned(), "1".to_owned())];
+
+        run_blocks(BlockOptions {
+            system: &system,
+            workloads: &workloads,
+            orders: &orders,
+            first_round: 1,
+            settle_seconds: 0,
+            idle_seconds: 0,
+            work_seconds: 1,
+            cwd: None,
+            env: &env,
+            env_clear: true,
+            before_block: &mut |_, _| Ok(()),
+            on_block: &mut |_| Ok(()),
+        })
+        .expect("the round runs");
+
+        let captures = runner.captures();
+        assert!(!captures.is_empty());
+        for measured in &captures {
+            assert!(measured.clear_env, "the environment starts empty");
+            assert_eq!(measured.env, env);
+        }
     }
 }
