@@ -812,4 +812,40 @@ mod tests {
             assert_eq!(measured.env, env);
         }
     }
+
+    #[test]
+    fn the_meta_preflight_holds_battery_and_thermal_state_beside_the_power_source() {
+        let record = PreflightRecord {
+            machine: PreflightReport {
+                power_source: "Now drawing from 'AC Power'".to_owned(),
+                battery: crate::preflight::BatteryState {
+                    present: true,
+                    percent: Some(82),
+                    state: "AC attached; not charging".to_owned(),
+                },
+                thermal: crate::preflight::ThermalState {
+                    warning: None,
+                    performance_warning: None,
+                    cpu_speed_limit: Some(100),
+                    cpu_power_limit: Some(100),
+                },
+                load_average: 1.69,
+                free_bytes: 5_212_016_640,
+            },
+            powermetrics: PowermetricsCheck {
+                sample_count: 2,
+                build: "24G517".to_owned(),
+                build_verified: true,
+                issues: Vec::new(),
+            },
+        };
+
+        let json = serde_json::to_value(&record).expect("the record serializes");
+        assert_eq!(json["powerSource"], "Now drawing from 'AC Power'");
+        assert_eq!(json["battery"]["percent"], 82);
+        assert_eq!(json["battery"]["state"], "AC attached; not charging");
+        assert_eq!(json["thermal"]["cpuSpeedLimit"], 100);
+        assert_eq!(json["thermal"]["cpuPowerLimit"], 100);
+        assert_eq!(json["powermetrics"]["sampleCount"], 2);
+    }
 }

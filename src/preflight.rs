@@ -42,6 +42,12 @@ const MILLISECONDS_PER_SECOND: f64 = 1_000.0;
 const LOAD_WARNING_DECIMALS: usize = 2;
 const MILLISECONDS_PER_SECOND_WHOLE: u64 = 1_000;
 
+/// The battery state recorded when the machine has no battery.
+pub const NO_BATTERY: &str = "no battery";
+
+/// The battery state recorded when a battery line has no readable percentage.
+pub const UNKNOWN_BATTERY_STATE: &str = "unknown";
+
 /// The key paths a usable powermetrics sample must carry.
 pub const REQUIRED_SAMPLE_PATHS: [&str; 5] = [
     "elapsed_ns",
@@ -59,8 +65,47 @@ const KNOWN_GOOD: &str = include_str!("../known-good/24G517.plist");
 #[serde(rename_all = "camelCase")]
 pub struct PreflightReport {
     pub power_source: String,
+    pub battery: BatteryState,
+    pub thermal: ThermalState,
     pub load_average: f64,
     pub free_bytes: u64,
+}
+
+/// What `pmset -g batt` said about the battery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatteryState {
+    /// Whether the command printed a battery line at all.
+    pub present: bool,
+    /// Charge in percent, when the line carries one.
+    pub percent: Option<u8>,
+    /// The charging state after the percentage, or `no battery` on a desktop.
+    pub state: String,
+}
+
+/// What `pmset -g therm` said about throttling.
+///
+/// Each field is `null` when the machine has recorded no value, including when
+/// the command itself is missing or fails.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThermalState {
+    pub warning: Option<u32>,
+    pub performance_warning: Option<u32>,
+    pub cpu_speed_limit: Option<u32>,
+    pub cpu_power_limit: Option<u32>,
+}
+
+impl ThermalState {
+    /// The state recorded when the machine reports nothing.
+    fn none() -> Self {
+        Self {
+            warning: None,
+            performance_warning: None,
+            cpu_speed_limit: None,
+            cpu_power_limit: None,
+        }
+    }
 }
 
 /// One thing wrong with one sample.
@@ -81,15 +126,23 @@ pub struct PowermetricsCheck {
     pub issues: Vec<SampleIssue>,
 }
 
-/// Prints the machine state, stops on low disk and makes sure sudo has a ticket.
+/// Reads the power, battery and thermal state, prints the machine state, stops
+/// on low disk and makes sure sudo has a ticket.
 pub fn run_preflight(
     system: &System,
     free_disk_path: &Path,
     write: &mut dyn FnMut(&str),
     stdin_is_terminal: bool,
 ) -> Result<PreflightReport, String> {
-    let battery = capture(system, &["pmset", "-g", "batt"])?;
-    let power_source = battery.lines().next().unwrap_or("").trim().to_owned();
+    let battery_output = capture(system, &["pmset", "-g", "batt"])?;
+    let power_source = battery_output
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let battery = parse_battery(&battery_output);
+    let thermal = read_thermal(system);
     let load_values = read_load_values(system)?;
     let load_average = load_values.first().copied().unwrap_or(0.0);
     let free_bytes = read_free_bytes(system, free_disk_path)?;
@@ -128,6 +181,8 @@ pub fn run_preflight(
     ensure_sudo_ticket(system, stdin_is_terminal)?;
     Ok(PreflightReport {
         power_source,
+        battery,
+        thermal,
         load_average,
         free_bytes,
     })
@@ -426,6 +481,103 @@ fn describe_value(value: Option<&plist::Value>) -> String {
     }
 }
 
+/// Parses the battery half of the report from `pmset -g batt` output.
+///
+/// The first line names the power source and each following non-empty line is
+/// one battery. A Mac with no battery prints no such line.
+pub fn parse_battery(output: &str) -> BatteryState {
+    let Some(line) = output.lines().skip(1).find(|line| !line.trim().is_empty()) else {
+        return BatteryState {
+            present: false,
+            percent: None,
+            state: NO_BATTERY.to_owned(),
+        };
+    };
+    let Some((before_percent, after_percent)) = line.split_once('%') else {
+        return BatteryState {
+            present: true,
+            percent: None,
+            state: UNKNOWN_BATTERY_STATE.to_owned(),
+        };
+    };
+
+    BatteryState {
+        present: true,
+        percent: trailing_percent(before_percent),
+        state: charging_state(after_percent),
+    }
+}
+
+/// The digits that end the text before `%`, such as the `82` in
+/// ` -InternalBattery-0 (id=22085731)\t82`.
+fn trailing_percent(text: &str) -> Option<u8> {
+    text.trim_end()
+        .rsplit(|character: char| !character.is_ascii_digit())
+        .next()
+        .and_then(|digits| digits.parse().ok())
+}
+
+/// The charging state after the percentage, without the `present: true` marker.
+fn charging_state(text: &str) -> String {
+    let state = text.trim_start_matches([';', ' ']).trim();
+    let state = state.strip_suffix("present: true").unwrap_or(state).trim();
+    if state.is_empty() {
+        UNKNOWN_BATTERY_STATE.to_owned()
+    } else {
+        state.to_owned()
+    }
+}
+
+/// Parses `pmset -g therm` output.
+///
+/// A machine that has recorded no warning prints `Note: No thermal warning
+/// level has been recorded` in place of a level, and one without CPU power
+/// status prints no limit lines. Both leave the corresponding field `null`.
+pub fn parse_thermal(output: &str) -> ThermalState {
+    let mut thermal = ThermalState::none();
+    for line in output.lines() {
+        let line = line.to_ascii_lowercase();
+        if line.contains("no thermal warning level") {
+            thermal.warning = None;
+        } else if let Some(value) = value_after(&line, "thermal warning level") {
+            thermal.warning = Some(value);
+        }
+        if line.contains("no performance warning level") {
+            thermal.performance_warning = None;
+        } else if let Some(value) = value_after(&line, "performance warning level") {
+            thermal.performance_warning = Some(value);
+        }
+        if let Some(value) = value_after(&line, "cpu_speed_limit") {
+            thermal.cpu_speed_limit = Some(value);
+        }
+        if let Some(value) = value_after(&line, "cpu_power_limit") {
+            thermal.cpu_power_limit = Some(value);
+        }
+    }
+    thermal
+}
+
+/// The number after `name =` in one lower-cased line, when the line has it.
+fn value_after(line: &str, name: &str) -> Option<u32> {
+    let (_, rest) = line.split_once(name)?;
+    let rest = rest.trim_start().strip_prefix('=')?;
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// Reads the thermal state, never failing the preflight for it.
+fn read_thermal(system: &System) -> ThermalState {
+    let arguments = ["pmset", "-g", "therm"].map(str::to_owned);
+    match system.runner.capture(&arguments, CaptureOptions::default()) {
+        Ok(captured) if captured.succeeded() => parse_thermal(&captured.stdout),
+        _ => ThermalState::none(),
+    }
+}
+
 fn capture(system: &System, argv: &[&str]) -> Result<String, String> {
     let argv: Vec<String> = argv.iter().map(|argument| (*argument).to_owned()).collect();
     let result = system.runner.capture(&argv, CaptureOptions::default())?;
@@ -490,7 +642,7 @@ fn read_busiest_processes(system: &System) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
     use crate::clock::FakeClock;
-    use crate::runner::{Captured, FakeRunner};
+    use crate::runner::{Captured, FakeRunner, Runner};
     use std::sync::Arc;
 
     /// The shipped sample plus the hardware model the preflight still requires.
@@ -628,5 +780,247 @@ mod tests {
                 .iter()
                 .any(|line| line == "Power:  Now drawing from 'AC Power'")
         );
+    }
+
+    fn captured(exit_code: i32, stdout: &str) -> Captured {
+        Captured {
+            exit_code,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        }
+    }
+
+    /// A machine whose two `pmset` queries answer from the given outputs.
+    fn preflight_system(
+        battery: &str,
+        thermal: &str,
+        thermal_exit: i32,
+    ) -> (System, Arc<FakeRunner>) {
+        let battery = battery.to_owned();
+        let thermal = thermal.to_owned();
+        let runner = Arc::new(FakeRunner::new(move |argv| {
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match argv.as_slice() {
+                ["pmset", "-g", "batt"] => captured(0, &battery),
+                ["pmset", "-g", "therm"] => captured(thermal_exit, &thermal),
+                ["sysctl", ..] => captured(0, "{ 1.00 2.00 3.00 }"),
+                ["df", ..] => captured(
+                    0,
+                    "Filesystem 1024-blocks Used Available Capacity Mounted\n\
+                     /dev/disk1 1000 500 4000000 10% /",
+                ),
+                ["ps", ..] => captured(0, "%CPU COMM\n 12.0 node\n"),
+                _ => captured(0, ""),
+            }
+        }));
+        let system = System {
+            runner: Arc::clone(&runner) as Arc<dyn Runner>,
+            clock: Arc::new(FakeClock::new(0)),
+        };
+        (system, runner)
+    }
+
+    #[test]
+    fn preflight_reads_battery_and_thermal_state_once() {
+        let battery = "Now drawing from 'AC Power'\n\
+             -InternalBattery-0 (id=22085731)\t82%; AC attached; not charging present: true\n";
+        let thermal = "Note: No thermal warning level has been recorded\n\
+             Note: No performance warning level has been recorded\n\
+             CPU_Speed_Limit              = 100\n\
+             CPU_Power_Limit              = 100\n";
+        let (system, runner) = preflight_system(battery, thermal, 0);
+        let mut printed = Vec::new();
+
+        let report = run_preflight(
+            &system,
+            Path::new("/"),
+            &mut |line| printed.push(line.to_owned()),
+            false,
+        )
+        .expect("the machine passes the preflight");
+
+        assert_eq!(report.power_source, "Now drawing from 'AC Power'");
+        assert_eq!(
+            report.battery,
+            BatteryState {
+                present: true,
+                percent: Some(82),
+                state: "AC attached; not charging".to_owned(),
+            }
+        );
+        assert_eq!(report.thermal.cpu_speed_limit, Some(100));
+        assert_eq!(report.thermal.cpu_power_limit, Some(100));
+        assert_eq!(report.thermal.warning, None);
+
+        let pmset_calls: Vec<Vec<String>> = runner
+            .argv()
+            .into_iter()
+            .filter(|argv| argv.first().map(String::as_str) == Some("pmset"))
+            .collect();
+        assert_eq!(
+            pmset_calls,
+            [["pmset", "-g", "batt"], ["pmset", "-g", "therm"]]
+                .map(|argv| argv.map(str::to_owned).to_vec()),
+            "battery output is read once and reused for the power source"
+        );
+    }
+
+    #[test]
+    fn a_failing_thermal_command_leaves_the_thermal_fields_empty() {
+        let battery = "Now drawing from 'Battery Power'\n\
+             -InternalBattery-0 (id=7)\t50%; discharging; 2:00 remaining present: true\n";
+        let (system, _) = preflight_system(battery, "thermal status unavailable", 1);
+        let mut printed = Vec::new();
+
+        let report = run_preflight(
+            &system,
+            Path::new("/"),
+            &mut |line| printed.push(line.to_owned()),
+            false,
+        )
+        .expect("a failing thermal query does not stop the preflight");
+
+        assert_eq!(report.thermal, ThermalState::none());
+        assert_eq!(report.battery.percent, Some(50));
+        assert_eq!(report.battery.state, "discharging; 2:00 remaining");
+    }
+
+    #[test]
+    fn a_charging_laptop_reports_its_charge_and_state() {
+        let battery = parse_battery(
+            "Now drawing from 'AC Power'\n\
+             -InternalBattery-0 (id=4653155)\t76%; charging; 0:31 remaining present: true\n",
+        );
+        assert_eq!(
+            battery,
+            BatteryState {
+                present: true,
+                percent: Some(76),
+                state: "charging; 0:31 remaining".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_laptop_held_on_ac_reports_its_state() {
+        let battery = parse_battery(
+            "Now drawing from 'AC Power'\n\
+             -InternalBattery-0 (id=22085731)\t94%; AC attached; not charging present: true\n",
+        );
+        assert_eq!(
+            battery,
+            BatteryState {
+                present: true,
+                percent: Some(94),
+                state: "AC attached; not charging".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_desktop_without_a_battery_says_so() {
+        let battery = parse_battery("Now drawing from 'AC Power'\n");
+        assert_eq!(
+            battery,
+            BatteryState {
+                present: false,
+                percent: None,
+                state: NO_BATTERY.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_battery_line_without_a_percentage_is_unknown() {
+        let battery = parse_battery(
+            "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7) present: true\n",
+        );
+        assert_eq!(
+            battery,
+            BatteryState {
+                present: true,
+                percent: None,
+                state: UNKNOWN_BATTERY_STATE.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn thermal_limits_are_read_when_the_machine_reports_them() {
+        let thermal = parse_thermal(
+            "Note: No thermal warning level has been recorded\n\
+             Note: No performance warning level has been recorded\n\
+             CPU_Speed_Limit              = 100\n\
+             CPU_Power_Limit              = 100\n",
+        );
+        assert_eq!(
+            thermal,
+            ThermalState {
+                warning: None,
+                performance_warning: None,
+                cpu_speed_limit: Some(100),
+                cpu_power_limit: Some(100),
+            }
+        );
+    }
+
+    #[test]
+    fn thermal_notes_become_empty_fields() {
+        let thermal = parse_thermal(
+            "Note: No thermal warning level has been recorded\n\
+             Note: No performance warning level has been recorded\n\
+             Note: No CPU power status has been recorded\n",
+        );
+        assert_eq!(thermal, ThermalState::none());
+    }
+
+    #[test]
+    fn recorded_thermal_warnings_are_read() {
+        let thermal = parse_thermal(
+            "2026-11-14 13:10:40 +0100 Thermal Warning Level = 1\n\
+             2026-11-14 13:10:40 +0100 Performance Warning Level = 2\n\
+             CPU_Speed_Limit = 89\n",
+        );
+        assert_eq!(thermal.warning, Some(1));
+        assert_eq!(thermal.performance_warning, Some(2));
+        assert_eq!(thermal.cpu_speed_limit, Some(89));
+        assert_eq!(thermal.cpu_power_limit, None);
+    }
+
+    #[test]
+    fn a_thermal_line_with_several_values_is_read() {
+        let thermal = parse_thermal(
+            "2020-11-24 13:10:40 +0100 CPU Power notify \
+             CPU_Scheduler_Limit = 100 CPU_Available_CPUs = 8 CPU_Speed_Limit = 35\n",
+        );
+        assert_eq!(thermal.cpu_speed_limit, Some(35));
+        assert_eq!(thermal.warning, None);
+    }
+
+    #[test]
+    fn the_report_gains_battery_and_thermal_objects_beside_the_power_source() {
+        let report = PreflightReport {
+            power_source: "Now drawing from 'AC Power'".to_owned(),
+            battery: BatteryState {
+                present: true,
+                percent: Some(94),
+                state: "AC attached; not charging".to_owned(),
+            },
+            thermal: ThermalState::none(),
+            load_average: 1.69,
+            free_bytes: 5_212_016_640,
+        };
+
+        let json = serde_json::to_value(&report).expect("the report serializes");
+        assert_eq!(json["powerSource"], "Now drawing from 'AC Power'");
+        assert_eq!(json["battery"]["present"], true);
+        assert_eq!(json["battery"]["percent"], 94);
+        assert_eq!(json["battery"]["state"], "AC attached; not charging");
+        assert!(json["thermal"]["warning"].is_null());
+        assert!(json["thermal"]["performanceWarning"].is_null());
+        assert!(json["thermal"]["cpuSpeedLimit"].is_null());
+        assert!(json["thermal"]["cpuPowerLimit"].is_null());
+        assert_eq!(json["loadAverage"], 1.69);
+        assert_eq!(json["freeBytes"], 5_212_016_640u64);
     }
 }
