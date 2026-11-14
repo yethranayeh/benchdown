@@ -9,6 +9,25 @@ fn benchdown(arguments: &[&str]) -> Output {
         .expect("benchdown starts")
 }
 
+fn benchdown_with_env(arguments: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_benchdown"));
+    command.args(arguments);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("benchdown starts")
+}
+
+fn temporary(name: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!(
+        "benchdown-cli-{}-{serial}-{name}",
+        std::process::id()
+    ))
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).expect("output is UTF-8")
 }
@@ -141,6 +160,177 @@ fn analyze_refuses_a_missing_file_without_a_usage_line() {
     let stderr = text(&output.stderr);
     assert!(stderr.contains("no-such-power.plist"), "{stderr}");
     assert!(!stderr.contains("Usage:"), "{stderr}");
+}
+
+const SESSION_HEADER: &str = "time\tload1\tload5\tload15\tcpu_percent\trss_kb\tpid\tcommand";
+
+#[test]
+fn session_help_lists_every_option() {
+    let output = benchdown(&["session", "--help"]);
+    assert!(output.status.success());
+    let help = text(&output.stdout);
+    for option in [
+        "--spotlight-off",
+        "--time-machine-off",
+        "--wifi-off",
+        "--jobs",
+        "--out",
+        "--sample-seconds",
+        "--stop-on-failure",
+        "--dry-run",
+        "restore",
+    ] {
+        assert!(
+            help.contains(option),
+            "{option} missing from session --help"
+        );
+    }
+}
+
+#[test]
+fn session_without_jobs_or_a_command_exits_two() {
+    let output = benchdown(&["session"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("--jobs"));
+}
+
+#[test]
+fn session_refuses_jobs_and_a_trailing_command_together() {
+    let output = benchdown(&["session", "--jobs", "jobs.json", "--", "echo", "hi"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("--jobs and --"), "{stderr}");
+}
+
+#[test]
+fn session_refuses_a_malformed_jobs_file() {
+    let path = temporary("jobs.json");
+    std::fs::write(&path, "[").expect("the jobs file writes");
+    let output = benchdown(&[
+        "session",
+        "--jobs",
+        path.to_str().expect("the path is UTF-8"),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("jobs file"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_session_dry_run_prints_the_plan_and_writes_nothing() {
+    let jobs = temporary("dry-jobs.json");
+    std::fs::write(
+        &jobs,
+        r#"[{"name":"hello","command":"echo hello","estimateMinutes":1}]"#,
+    )
+    .expect("the jobs file writes");
+    let out = temporary("dry-out");
+    let state = temporary("dry-state.json");
+    let output = benchdown_with_env(
+        &[
+            "session",
+            "--dry-run",
+            "--jobs",
+            jobs.to_str().expect("the path is UTF-8"),
+            "--out",
+            out.to_str().expect("the path is UTF-8"),
+        ],
+        &[(
+            "BENCHDOWN_SESSION_STATE_FILE",
+            state.to_str().expect("the path is UTF-8"),
+        )],
+    );
+    let stdout = text(&output.stdout);
+    assert!(output.status.success(), "{stdout}{}", text(&output.stderr));
+    assert!(stdout.contains("hello"), "{stdout}");
+    assert!(stdout.contains("echo hello"), "{stdout}");
+    assert!(stdout.contains("Dry run"), "{stdout}");
+    assert!(stdout.contains("benchdown session restore"), "{stdout}");
+    assert!(!out.exists(), "a dry run writes no session folder");
+    assert!(!state.exists(), "a dry run writes no state file");
+    let _ = std::fs::remove_file(&jobs);
+}
+
+#[test]
+fn session_restore_without_a_state_file_exits_zero() {
+    let state = temporary("missing-state.json");
+    let _ = std::fs::remove_file(&state);
+    let output = benchdown_with_env(
+        &["session", "restore"],
+        &[(
+            "BENCHDOWN_SESSION_STATE_FILE",
+            state.to_str().expect("the path is UTF-8"),
+        )],
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).contains("No restore state file"));
+}
+
+#[test]
+fn analyze_takes_session_samples_and_drops_the_round() {
+    let samples = temporary("samples.tsv");
+    std::fs::write(
+        &samples,
+        format!(
+            "{SESSION_HEADER}\n2026-11-08T10:00:05Z\t4.4\t2.0\t1.5\t1.0\t512\t101\t/usr/sbin/mds\n"
+        ),
+    )
+    .expect("the samples file writes");
+
+    let output = benchdown(&[
+        "analyze",
+        "--json",
+        &fixture("power.plist"),
+        &fixture("blocks.tsv"),
+        samples.to_str().expect("the path is UTF-8"),
+    ]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let analysis: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(
+        analysis["contaminatedBlocks"]
+            .as_array()
+            .expect("blocks")
+            .len(),
+        1
+    );
+    assert_eq!(analysis["contaminatedBlocks"][0]["reason"], "load");
+    assert_eq!(analysis["droppedRounds"], serde_json::json!([1]));
+    assert_eq!(analysis["workloads"][0]["cleanRounds"], 0);
+    let _ = std::fs::remove_file(&samples);
+}
+
+#[test]
+fn analyze_refuses_an_unreadable_session_samples_file() {
+    let output = benchdown(&[
+        "analyze",
+        &fixture("power.plist"),
+        &fixture("blocks.tsv"),
+        "no-such-samples.tsv",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("no-such-samples.tsv"), "{stderr}");
+}
+
+#[test]
+fn run_refuses_an_unreadable_session_samples_file_before_sampling() {
+    let missing = temporary("missing-samples.tsv");
+    let _ = std::fs::remove_file(&missing);
+    let output = benchdown_with_env(
+        &["run", "--check", "-N", "true"],
+        &[(
+            "BENCHDOWN_SESSION_SAMPLES",
+            missing.to_str().expect("the path is UTF-8"),
+        )],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("BENCHDOWN_SESSION_SAMPLES"), "{stderr}");
+    assert!(stderr.contains("missing-samples.tsv"), "{stderr}");
+    let stdout = text(&output.stdout);
+    assert!(!stdout.contains("Results:"), "{stdout}");
+    assert!(!stdout.contains("Plan:"), "{stdout}");
 }
 
 fn reference_directory(variable: &str) -> Option<std::path::PathBuf> {

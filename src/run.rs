@@ -12,7 +12,9 @@ use crate::analysis::{
 use crate::blocks::{BlockKind, BlockRow, format_header, format_row};
 use crate::cli::{Plan, command_argv, format_seconds};
 use crate::export::{self, RunInfo};
-use crate::gate::{QUIET_LOAD, QUIET_WAIT_LIMIT_SECONDS, QuietWait, wait_for_quiet};
+use crate::gate::{
+    QUIET_LOAD, QUIET_WAIT_LIMIT_SECONDS, QuietWait, find_contaminated_blocks, wait_for_quiet,
+};
 use crate::powermetrics::{Powermetrics, START_LEAD_SECONDS, planned_sample_limit};
 use crate::preflight::{
     PowermetricsCheck, PreflightReport, check_powermetrics, run_preflight, start_sudo_keepalive,
@@ -20,6 +22,7 @@ use crate::preflight::{
 use crate::runner::{CaptureOptions, System, temporary_path};
 use crate::samples::parse_power_log;
 use crate::schedule::round_orders;
+use crate::session::sampler::{SESSION_SAMPLES_ENV, read_samples_file};
 
 const MILLISECONDS_PER_SECOND: u64 = 1_000;
 
@@ -194,6 +197,9 @@ struct PreflightRecord {
 
 /// Measures the plan and writes its output folder.
 pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
+    // The session wrapper writes the samples while this run is in progress, so
+    // the file is checked once here and read again when the round is analyzed.
+    let session_samples = session_samples_path()?;
     let started_ms = system.clock.now_ms();
     let directory = match &plan.out {
         Some(directory) => directory.clone(),
@@ -282,7 +288,7 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
         // A run planned below the minimum, such as --check, is not topped up.
         let tops_up = plan.rounds >= MINIMUM_CLEAN_ROUNDS as u64;
         while tops_up && extra_rounds < MAXIMUM_EXTRA_ROUNDS {
-            let analysis = analyze_so_far(&power_path, &rows)?;
+            let analysis = analyze_so_far(&power_path, &rows, session_samples.as_deref())?;
             let short = workloads_short_of_clean_rounds(&analysis);
             if short.is_empty() {
                 break;
@@ -318,7 +324,7 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
     // The sampler is stopped and the file handed back before the final read, so
     // the trailing samples are on disk.
     let rows = measured?;
-    let analysis = analyze_so_far(&power_path, &rows)?;
+    let analysis = analyze_so_far(&power_path, &rows, session_samples.as_deref())?;
     let ended_at = timestamp(system)?;
     let os_build = check.build.clone();
     let hardware_model = hardware_model(&power_path);
@@ -460,11 +466,39 @@ fn append_block(path: &Path, row: &BlockRow) -> Result<(), String> {
     writeln!(file, "{}", format_row(row)).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn analyze_so_far(power_path: &Path, rows: &[BlockRow]) -> Result<Analysis, String> {
+fn analyze_so_far(
+    power_path: &Path,
+    rows: &[BlockRow],
+    session_samples: Option<&Path>,
+) -> Result<Analysis, String> {
     let text = std::fs::read_to_string(power_path)
         .map_err(|error| format!("{}: {error}", power_path.display()))?;
     let samples = parse_power_log(&text);
-    analyze(&samples, rows, &[])
+    let contaminated = match session_samples {
+        Some(path) => find_contaminated_blocks(&read_samples_file(path)?, rows),
+        None => Vec::new(),
+    };
+    analyze(&samples, rows, &contaminated)
+}
+
+/// The samples file named by the session, checked before the sampler starts.
+fn session_samples_path() -> Result<Option<PathBuf>, String> {
+    session_samples_from(std::env::var_os(SESSION_SAMPLES_ENV))
+}
+
+/// Splits the environment lookup out, so a test can drive it without changing the process.
+fn session_samples_from(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>, String> {
+    let Some(path) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    read_samples_file(&path).map_err(|error| {
+        format!(
+            "{SESSION_SAMPLES_ENV} is set to {} but its samples cannot be read: {error}",
+            path.display()
+        )
+    })?;
+    Ok(Some(path))
 }
 
 fn build_workloads(plan: &Plan) -> Result<Vec<Workload>, String> {
@@ -811,6 +845,73 @@ mod tests {
             assert!(measured.clear_env, "the environment starts empty");
             assert_eq!(measured.env, env);
         }
+    }
+
+    #[test]
+    fn the_session_samples_path_comes_from_the_environment() {
+        assert_eq!(session_samples_from(None), Ok(None));
+        assert_eq!(
+            session_samples_from(Some(std::ffi::OsString::new())),
+            Ok(None)
+        );
+        let path = std::env::temp_dir().join(format!(
+            "benchdown-run-test-{}-env-samples.tsv",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "time\tload1\tload5\tload15\tcpu_percent\trss_kb\tpid\tcommand\n",
+        )
+        .expect("the samples file writes");
+        assert_eq!(
+            session_samples_from(Some(path.clone().into_os_string())),
+            Ok(Some(path.clone()))
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unreadable_session_samples_path_names_the_variable_and_the_file() {
+        let missing = std::env::temp_dir().join(format!(
+            "benchdown-run-test-{}-missing-samples.tsv",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let error = session_samples_from(Some(missing.clone().into_os_string()))
+            .expect_err("a missing samples file is refused");
+        assert!(error.contains(SESSION_SAMPLES_ENV), "{error}");
+        assert!(error.contains("missing-samples.tsv"), "{error}");
+    }
+
+    #[test]
+    fn a_session_samples_file_marks_its_block_contaminated() {
+        let blocks = crate::blocks::parse_blocks(include_str!("../tests/fixtures/blocks.tsv"))
+            .expect("the fixture block log parses");
+        let power_path = std::env::temp_dir().join(format!(
+            "benchdown-run-test-{}-power.plist",
+            std::process::id()
+        ));
+        std::fs::write(&power_path, include_str!("../tests/fixtures/power.plist"))
+            .expect("the power fixture writes");
+        let samples_path = std::env::temp_dir().join(format!(
+            "benchdown-run-test-{}-samples.tsv",
+            std::process::id()
+        ));
+        std::fs::write(
+            &samples_path,
+            "time\tload1\tload5\tload15\tcpu_percent\trss_kb\tpid\tcommand\n\
+             2026-11-08T10:00:05Z\t4.4\t2.0\t1.5\t1.0\t512\t101\t/usr/sbin/mds\n",
+        )
+        .expect("the samples file writes");
+
+        let analysis = analyze_so_far(&power_path, &blocks, Some(&samples_path))
+            .expect("the fixture analyzes");
+
+        assert_eq!(analysis.contaminated_blocks.len(), 1);
+        assert_eq!(analysis.dropped_rounds, [1]);
+        assert_eq!(analysis.workloads[0].clean_rounds, 0);
+        let _ = std::fs::remove_file(&power_path);
+        let _ = std::fs::remove_file(&samples_path);
     }
 
     #[test]

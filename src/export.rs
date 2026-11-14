@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::analysis::{Analysis, BlockAnalysis, CleanVerdict, DropReason, Verdict};
 use crate::blocks::BlockKind;
+use crate::gate::ContaminationReason;
 
 /// The metric this file reports.
 pub const PRIMARY_METRIC: &str = "energy_per_run";
@@ -113,12 +114,38 @@ struct Summary {
     max: f64,
 }
 
+/// Why a round was dropped, in the export's own words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DroppedReason {
+    Idle,
+    Work,
+    Load,
+    Process,
+}
+
+impl DroppedReason {
+    fn order(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Work => 1,
+            Self::Load => 2,
+            Self::Process => 3,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DroppedRound {
     round: u64,
-    reason: DropReason,
-    observed_mw: f64,
-    limit_mw: f64,
+    reason: DroppedReason,
+    /// `milliwatt` for the idle and work limits, `load` or `percent` for contamination.
+    unit: &'static str,
+    observed: f64,
+    limit: f64,
+    /// The background process, for a process reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process: Option<String>,
 }
 
 /// What a live run knows that the analysis does not.
@@ -260,25 +287,73 @@ impl Summary {
     }
 }
 
-/// One entry per dropped round, keeping the first recorded reason.
+/// One entry per reason that dropped one of this result's rounds.
+///
+/// The round is global to the schedule, so an idle spike on another command in
+/// the same round still leaves this result's clean summary without it; that entry
+/// is kept here. Contamination reasons are added beside an idle or work reason,
+/// never instead of it.
 fn dropped_rounds(analysis: &Analysis, label: &str) -> Vec<DroppedRound> {
-    let mut entries: Vec<DroppedRound> = Vec::new();
-    for dropped in analysis
-        .dropped_blocks
+    let mut rounds: Vec<u64> = analysis
+        .blocks
         .iter()
-        .filter(|dropped| dropped.label == label)
-    {
-        if entries.iter().any(|entry| entry.round == dropped.round) {
-            continue;
+        .filter(|block| {
+            block.kind == BlockKind::Work
+                && block.label.as_str() == label
+                && block.per_run_mj.is_some()
+        })
+        .map(|block| block.round)
+        .collect();
+    rounds.sort_unstable();
+    rounds.dedup();
+
+    let mut entries: Vec<DroppedRound> = Vec::new();
+    for round in rounds {
+        if let Some(dropped) = analysis
+            .dropped_blocks
+            .iter()
+            .find(|dropped| dropped.round == round)
+        {
+            entries.push(DroppedRound {
+                round,
+                reason: match dropped.reason {
+                    DropReason::Idle => DroppedReason::Idle,
+                    DropReason::Work => DroppedReason::Work,
+                },
+                unit: "milliwatt",
+                observed: dropped.observed_mw,
+                limit: dropped.limit_mw,
+                process: None,
+            });
         }
-        entries.push(DroppedRound {
-            round: dropped.round,
-            reason: dropped.reason,
-            observed_mw: dropped.observed_mw,
-            limit_mw: dropped.limit_mw,
-        });
+
+        let mut seen: Vec<ContaminationReason> = Vec::new();
+        for contaminated in analysis
+            .contaminated_blocks
+            .iter()
+            .filter(|contaminated| contaminated.round == round)
+        {
+            if seen.contains(&contaminated.reason) {
+                continue;
+            }
+            seen.push(contaminated.reason);
+            entries.push(DroppedRound {
+                round,
+                reason: match contaminated.reason {
+                    ContaminationReason::Load => DroppedReason::Load,
+                    ContaminationReason::Process => DroppedReason::Process,
+                },
+                unit: match contaminated.reason {
+                    ContaminationReason::Load => "load",
+                    ContaminationReason::Process => "percent",
+                },
+                observed: contaminated.observed,
+                limit: contaminated.limit,
+                process: contaminated.process.clone(),
+            });
+        }
     }
-    entries.sort_by_key(|entry| entry.round);
+    entries.sort_by_key(|entry| (entry.round, entry.reason.order()));
     entries
 }
 
@@ -433,8 +508,64 @@ mod tests {
         assert_eq!(dropped.len(), 1, "one entry per round, not per block");
         assert_eq!(dropped[0]["round"], 1);
         assert_eq!(dropped[0]["reason"], "idle");
-        assert_eq!(number(&dropped[0]["observed_mw"]), 1962.0);
-        assert_eq!(number(&dropped[0]["limit_mw"]), 1000.0);
+        assert_eq!(dropped[0]["unit"], "milliwatt");
+        assert_eq!(number(&dropped[0]["observed"]), 1962.0);
+        assert_eq!(number(&dropped[0]["limit"]), 1000.0);
+    }
+
+    #[test]
+    fn a_contaminated_round_reports_its_own_reason_beside_the_idle_one() {
+        let mut analysis = hand_built_analysis();
+        analysis.contaminated_blocks = vec![
+            crate::gate::ContaminatedBlock {
+                round: 1,
+                label: "x".to_owned(),
+                kind: BlockKind::Work,
+                reason: ContaminationReason::Load,
+                observed: 4.4,
+                limit: 3.5,
+                process: None,
+            },
+            crate::gate::ContaminatedBlock {
+                round: 1,
+                label: "x".to_owned(),
+                kind: BlockKind::Work,
+                reason: ContaminationReason::Process,
+                observed: 42.0,
+                limit: 20.0,
+                process: Some("mds_stores".to_owned()),
+            },
+        ];
+        let workloads = [("x".to_owned(), "echo x".to_owned())];
+        let export = build(
+            &analysis,
+            RunInfo {
+                workloads: &workloads,
+                started_at: "2026-11-11T23:10:47Z",
+                os_build: "24G517",
+                hardware_model: "Mac16,1",
+                os: "Darwin",
+                architecture: "arm64",
+            },
+        )
+        .expect("the analysis exports");
+        let json = serde_json::to_value(&export).expect("the export serializes");
+        let dropped = json["results"][0]["dropped_rounds"]
+            .as_array()
+            .expect("dropped rounds is an array");
+
+        assert_eq!(dropped.len(), 3, "idle, load and process all survive");
+        assert_eq!(dropped[0]["reason"], "idle");
+        assert_eq!(dropped[1]["reason"], "load");
+        assert_eq!(dropped[1]["unit"], "load");
+        assert_eq!(number(&dropped[1]["observed"]), 4.4);
+        assert_eq!(number(&dropped[1]["limit"]), 3.5);
+        assert!(dropped[1].get("process").is_none());
+        assert_eq!(dropped[2]["reason"], "process");
+        assert_eq!(dropped[2]["unit"], "percent");
+        assert_eq!(number(&dropped[2]["observed"]), 42.0);
+        assert_eq!(number(&dropped[2]["limit"]), 20.0);
+        assert_eq!(dropped[2]["process"], "mds_stores");
     }
 
     #[test]
@@ -468,6 +599,33 @@ mod tests {
         assert_eq!(summary.min, 2.0);
         assert_eq!(summary.max, 6.0);
         assert_eq!(Summary::new(&[5.0]).stddev, None);
+    }
+
+    #[test]
+    fn a_round_dropped_for_another_command_still_names_its_reason() {
+        let mut analysis = hand_built_analysis();
+        analysis.dropped_blocks[0].label = "other".to_owned();
+        let workloads = [("x".to_owned(), "echo x".to_owned())];
+        let export = build(
+            &analysis,
+            RunInfo {
+                workloads: &workloads,
+                started_at: "2026-11-11T23:10:47Z",
+                os_build: "24G517",
+                hardware_model: "Mac16,1",
+                os: "Darwin",
+                architecture: "arm64",
+            },
+        )
+        .expect("the analysis exports");
+        let json = serde_json::to_value(&export).expect("the export serializes");
+        let dropped = json["results"][0]["dropped_rounds"]
+            .as_array()
+            .expect("dropped rounds is an array");
+
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0]["round"], 1);
+        assert_eq!(dropped[0]["reason"], "idle");
     }
 
     fn hand_built_analysis() -> Analysis {

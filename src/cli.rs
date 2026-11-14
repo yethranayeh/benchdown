@@ -43,6 +43,130 @@ pub enum ArgsCommand {
     Run(RunArgs),
     /// Report energy per run from a recorded power log and block log
     Analyze(AnalyzeArgs),
+    /// Prepare the Mac, run jobs, and restore every changed setting
+    Session(SessionArgs),
+}
+
+/// Everything `benchdown session` accepts.
+#[derive(Debug, ClapArgs)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub action: Option<SessionAction>,
+
+    /// Turn Spotlight indexing off for the session
+    #[arg(long)]
+    pub spotlight_off: bool,
+
+    /// Turn automatic Time Machine backups off for the session
+    #[arg(long)]
+    pub time_machine_off: bool,
+
+    /// Turn the Wi-Fi interface off for the session
+    #[arg(long)]
+    pub wifi_off: bool,
+
+    /// JSON file with an array of {name, command, estimateMinutes}
+    #[arg(long, value_name = "FILE")]
+    pub jobs: Option<PathBuf>,
+
+    /// Session output folder (default ./benchdown-sessions)
+    #[arg(long, value_name = "DIR")]
+    pub out: Option<PathBuf>,
+
+    /// Seconds between load and process samples
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub sample_seconds: Option<u64>,
+
+    /// Stop after the first failed job
+    #[arg(long)]
+    pub stop_on_failure: bool,
+
+    /// Print the plan without changing anything or asking for a password
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// The command to run, after --
+    #[arg(last = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum SessionAction {
+    /// Undo a session that died before it could restore its changes
+    Restore,
+}
+
+/// What `benchdown session` will do after its arguments resolve.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionRequest {
+    Run(SessionRunPlan),
+    Restore,
+}
+
+/// The resolved plan for one session run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRunPlan {
+    pub settings: crate::session::settings::SettingFlags,
+    pub jobs: Vec<crate::session::jobs::JobSpec>,
+    pub stop_on_failure: bool,
+    pub dry_run: bool,
+    pub out: Option<PathBuf>,
+    pub sample_seconds: u64,
+}
+
+impl SessionArgs {
+    /// Resolves typed arguments into a session or the restore command.
+    ///
+    /// Fails with a message for a command line clap accepts but a session cannot use.
+    pub fn resolve(self) -> Result<SessionRequest, String> {
+        if self.action == Some(SessionAction::Restore) {
+            let extra = self.spotlight_off
+                || self.time_machine_off
+                || self.wifi_off
+                || self.jobs.is_some()
+                || self.out.is_some()
+                || self.sample_seconds.is_some()
+                || self.stop_on_failure
+                || self.dry_run
+                || !self.command.is_empty();
+            if extra {
+                return Err("restore takes no other arguments".to_owned());
+            }
+            return Ok(SessionRequest::Restore);
+        }
+
+        if self.jobs.is_some() && !self.command.is_empty() {
+            return Err("--jobs and -- cannot be used together".to_owned());
+        }
+        let jobs = match &self.jobs {
+            Some(path) => crate::session::jobs::read_jobs_file(path)?,
+            None if !self.command.is_empty() => {
+                vec![crate::session::jobs::command_job(&self.command)?]
+            }
+            None => {
+                return Err("pass --jobs <jobs.json> or -- <command...>".to_owned());
+            }
+        };
+
+        Ok(SessionRequest::Run(SessionRunPlan {
+            settings: crate::session::settings::SettingFlags {
+                spotlight: self.spotlight_off,
+                time_machine: self.time_machine_off,
+                wifi: self.wifi_off,
+            },
+            jobs,
+            stop_on_failure: self.stop_on_failure,
+            dry_run: self.dry_run,
+            out: self.out,
+            sample_seconds: self
+                .sample_seconds
+                .unwrap_or(crate::session::DEFAULT_SAMPLE_SECONDS),
+        }))
+    }
 }
 
 /// Everything `benchdown analyze` accepts.
@@ -56,19 +180,30 @@ pub struct AnalyzeArgs {
     #[arg(value_name = "BLOCKS")]
     pub blocks: PathBuf,
 
+    /// Optional samples written by benchdown session, for the contamination check
+    #[arg(value_name = "SESSION_SAMPLES")]
+    pub session_samples: Option<PathBuf>,
+
     /// Print the analysis as JSON instead of a table
     #[arg(long)]
     pub json: bool,
 }
 
 impl AnalyzeArgs {
-    /// Reads both logs, analyzes them and prints the result.
+    /// Reads the logs, analyzes them and prints the result.
     pub fn report(self) -> Result<(), String> {
         let power = read(&self.power)?;
         let block_log = read(&self.blocks)?;
         let samples = samples::parse_power_log(&power);
         let blocks = blocks::parse_blocks(&block_log)?;
-        let analysis = analysis::analyze(&samples, &blocks, &[])?;
+        let contaminated = match &self.session_samples {
+            Some(path) => {
+                let session = crate::session::sampler::read_samples_file(path)?;
+                crate::gate::find_contaminated_blocks(&session, &blocks)
+            }
+            None => Vec::new(),
+        };
+        let analysis = analysis::analyze(&samples, &blocks, &contaminated)?;
 
         if self.json {
             let json =
@@ -386,13 +521,18 @@ pub fn format_seconds(total: u64) -> String {
 
 /// Prints a refused command line and exits with clap's usage-error status.
 pub fn exit_with(message: &str) -> ! {
+    exit_subcommand_with("run", message)
+}
+
+/// Prints a refused subcommand line and exits with clap's usage-error status.
+pub fn exit_subcommand_with(name: &str, message: &str) -> ! {
     let mut command = Args::command();
-    let mut run = command
-        .find_subcommand_mut("run")
-        .expect("the run subcommand is declared")
+    let mut sub = command
+        .find_subcommand_mut(name)
+        .unwrap_or_else(|| panic!("the {name} subcommand is declared"))
         .clone()
-        .bin_name("benchdown run");
-    run.error(ErrorKind::InvalidValue, message.to_owned())
+        .bin_name(format!("benchdown {name}"));
+    sub.error(ErrorKind::InvalidValue, message.to_owned())
         .exit()
 }
 
@@ -409,7 +549,9 @@ mod tests {
         };
         match parsed.command {
             ArgsCommand::Run(run) => Plan::new(run),
-            ArgsCommand::Analyze(_) => unreachable!("the helper always builds a run command"),
+            ArgsCommand::Analyze(_) | ArgsCommand::Session(_) => {
+                unreachable!("the helper always builds a run command")
+            }
         }
     }
 

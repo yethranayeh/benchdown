@@ -13,6 +13,7 @@ mod run;
 mod runner;
 mod samples;
 mod schedule;
+mod session;
 
 use clap::Parser;
 
@@ -34,6 +35,18 @@ fn main() {
                 eprintln!("error: {message}");
                 std::process::exit(1);
             }
+        }
+        cli::ArgsCommand::Session(args) => {
+            let request = match args.resolve() {
+                Ok(request) => request,
+                Err(message) => cli::exit_subcommand_with("session", &message),
+            };
+            let system = runner::System::new();
+            let code = match request {
+                cli::SessionRequest::Restore => session::restore(&system),
+                cli::SessionRequest::Run(plan) => session::run(&plan, &system),
+            };
+            std::process::exit(code);
         }
     }
 }
