@@ -14,8 +14,12 @@ per command with its spread.
 Rust 1.85 or newer, on macOS or Linux:
 
 ```sh
-cargo install --path .
+cargo install benchdown
 ```
+
+From a checkout, `cargo install --path .` does the same. The crate page is
+[`benchdown` on crates.io](https://crates.io/crates/benchdown), and the API
+documentation is on [docs.rs](https://docs.rs/benchdown).
 
 ## Usage
 
