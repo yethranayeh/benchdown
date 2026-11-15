@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 760" width="120" height="120">
+  <title>benchdown</title>
+  <mask id="cut">
+    <rect width="760" height="760" rx="176" fill="#fff"/>
+    <g fill="#000" transform="translate(158 121) scale(0.74)">
+      <rect x="10" y="10" width="80" height="580" rx="16"/>
+      <rect x="110" y="10" width="80" height="580" rx="16"/>
+      <rect x="210" y="210" width="80" height="80" rx="16"/>
+      <rect x="310" y="210" width="80" height="80" rx="16"/>
+      <rect x="210" y="310" width="80" height="80" rx="16"/>
+      <rect x="310" y="310" width="80" height="80" rx="16"/>
+      <rect x="410" y="310" width="80" height="80" rx="16"/>
+      <rect x="510" y="310" width="80" height="280" rx="16"/>
+      <rect x="410" y="410" width="80" height="280" rx="16"/>
+      <rect x="110" y="610" width="80" height="80" rx="16"/>
+      <rect x="210" y="610" width="80" height="80" rx="16"/>
+      <rect x="310" y="610" width="80" height="80" rx="16"/>
+    </g>
+  </mask>
+  <rect width="760" height="760" rx="176" fill="#17150f" mask="url(#cut)"/>
+</svg>
