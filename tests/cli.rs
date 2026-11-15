@@ -61,6 +61,7 @@ fn run_help_lists_every_option() {
         "--cwd",
         "--env",
         "--env-clear",
+        "--sensor",
         "--rounds",
         "--idle",
         "--work",
@@ -465,4 +466,27 @@ fn recorded_run_a_table_matches() {
         assert!(table.contains(row), "{row} missing from:\n{table}");
     }
     assert!(table.contains("dropped blocks: none"), "{table}");
+}
+
+#[test]
+fn a_sensor_this_platform_lacks_exits_two_with_the_names_it_has() {
+    let missing = if cfg!(target_os = "macos") {
+        "rapl"
+    } else {
+        "smc"
+    };
+    let output = benchdown(&["run", "--sensor", missing, "true"]);
+    assert_eq!(output.status.code(), Some(2));
+    let message = text(&output.stderr);
+    assert!(message.contains("is not available on"), "{message}");
+    assert!(message.contains(missing), "{message}");
+}
+
+#[test]
+fn an_unknown_sensor_exits_two_and_lists_the_choices() {
+    let output = benchdown(&["run", "--sensor", "gpu", "true"]);
+    assert_eq!(output.status.code(), Some(2));
+    let message = text(&output.stderr);
+    assert!(message.contains("unknown sensor gpu"), "{message}");
+    assert!(message.contains("powermetrics, smc, rapl"), "{message}");
 }

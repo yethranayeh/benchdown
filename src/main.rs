@@ -6,6 +6,7 @@ mod cli;
 mod clock;
 mod export;
 mod gate;
+mod meter;
 mod powermetrics;
 mod preflight;
 mod random;
@@ -13,6 +14,7 @@ mod run;
 mod runner;
 mod samples;
 mod schedule;
+mod sensor;
 mod session;
 
 use clap::Parser;

@@ -23,9 +23,10 @@ cargo install --path .
 benchdown run 'cargo build'
 ```
 
-A run needs `sudo` for `powermetrics`, a machine on AC power and 2 GB of free
-disk. It writes `power.plist`, `blocks.tsv`, `analysis.json` and `meta.json` to
-`./benchdown-<date>/`, or to `--out <dir>`.
+A run needs a machine on AC power and 2 GB of free disk, plus `sudo` when the
+sensor is `powermetrics`. It writes `blocks.tsv`, `analysis.json` and `meta.json`
+to `./benchdown-<date>/`, or to `--out <dir>`, with the raw samples in
+`power.plist` (powermetrics) or `samples.tsv` (a counter sensor).
 
 `--export-json <file>` writes the results as hyperfine-shaped JSON (schema version 2).
 
@@ -40,8 +41,20 @@ It splits the string into words with quotes and backslashes, so
 not expand variables or interpret pipes, redirections or other shell operators.
 A string it cannot split is refused before the run starts.
 
-It reports whole-machine processor energy above an idle baseline, not the energy
-of one process.
+`--sensor <sensor>` picks where the power samples come from:
+
+- `powermetrics` (macOS default): processor, GPU and ANE power. Needs `sudo` and
+  reports whole-machine processor energy above an idle baseline.
+- `smc` (macOS): AppleSMC whole-system power, no `sudo`. There is no
+  processor-only SMC key on Apple Silicon, so this measures the whole machine,
+  display and peripherals included. It idles far above processor power, so the
+  idle limit does not apply and only the work-spike rule can drop a round.
+- `rapl` (Linux default): Intel or AMD package energy from the RAPL counters.
+  Needs the `msr` module and read access to `/dev/cpu/*/msr`.
+
+Every run records the sensor it used in `meta.json` and prints it above the
+table. `benchdown analyze` takes the same `--sensor` so a log is analyzed with
+the limits that suit it, and reads either a `power.plist` or a `samples.tsv`.
 
 ## Prepare a quiet session
 
@@ -73,6 +86,11 @@ above 3.5 or a background indexing, backup or analysis service at 20% CPU or
 more. `benchdown analyze` takes the same file as an optional third path.
 
 The energy method is adapted from [Zinn's measurement harness](https://github.com/yethranayeh/zinn) (MIT).
+
+The RAPL register numbers and the AppleSMC keys come from
+[EnergiBridge](https://github.com/tdurieux/EnergiBridge) (MIT). AppleSMC reads
+use the [`smc`](https://crates.io/crates/smc) crate (WTFPL). See
+[THIRD-PARTY.md](THIRD-PARTY.md).
 
 ## Licence
 

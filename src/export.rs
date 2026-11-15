@@ -11,6 +11,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::analysis::{Analysis, BlockAnalysis, CleanVerdict, DropReason, Verdict};
+
 use crate::blocks::BlockKind;
 use crate::gate::ContaminationReason;
 
@@ -373,7 +374,8 @@ mod tests {
     fn fixture_analysis() -> Analysis {
         let samples = parse_power_log(POWER);
         let blocks = parse_blocks(BLOCKS).expect("the fixture block log parses");
-        analyze(&samples, &blocks, &[]).expect("the fixture analyzes")
+        analyze(&samples, &blocks, &[], crate::analysis::Limits::default())
+            .expect("the fixture analyzes")
     }
 
     fn fixture_export() -> Value {

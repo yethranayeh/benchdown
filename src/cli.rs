@@ -7,6 +7,7 @@ use clap::{Args as ClapArgs, CommandFactory, Parser, Subcommand, error::ErrorKin
 use crate::analysis;
 use crate::blocks;
 use crate::samples;
+use crate::sensor::Sensor;
 
 /// Defaults follow Zinn's measurement harness, which benchdown's method comes from.
 pub const DEFAULT_ROUNDS: u64 = 5;
@@ -184,6 +185,10 @@ pub struct AnalyzeArgs {
     #[arg(value_name = "SESSION_SAMPLES")]
     pub session_samples: Option<PathBuf>,
 
+    /// Sensor the power log came from; whole-system sensors skip the idle limit
+    #[arg(long, value_name = "SENSOR")]
+    pub sensor: Option<String>,
+
     /// Print the analysis as JSON instead of a table
     #[arg(long)]
     pub json: bool,
@@ -194,7 +199,11 @@ impl AnalyzeArgs {
     pub fn report(self) -> Result<(), String> {
         let power = read(&self.power)?;
         let block_log = read(&self.blocks)?;
-        let samples = samples::parse_power_log(&power);
+        let samples = if samples::is_samples_file(&power) {
+            samples::parse_samples_file(&power)?
+        } else {
+            samples::parse_power_log(&power)
+        };
         let blocks = blocks::parse_blocks(&block_log)?;
         let contaminated = match &self.session_samples {
             Some(path) => {
@@ -203,7 +212,13 @@ impl AnalyzeArgs {
             }
             None => Vec::new(),
         };
-        let analysis = analysis::analyze(&samples, &blocks, &contaminated)?;
+        let sensor = Sensor::resolve(self.sensor.as_deref())?;
+        let analysis = analysis::analyze(
+            &samples,
+            &blocks,
+            &contaminated,
+            analysis::Limits::for_sensor(sensor),
+        )?;
 
         if self.json {
             let json =
@@ -261,6 +276,10 @@ pub struct RunArgs {
     /// Start the measured commands with an empty environment
     #[arg(long)]
     pub env_clear: bool,
+
+    /// Where the power samples come from: powermetrics or smc on macOS, rapl on Linux
+    #[arg(long, value_name = "SENSOR")]
+    pub sensor: Option<String>,
 
     /// Rounds over the workloads, at most 10000
     #[arg(
@@ -348,6 +367,8 @@ pub struct Plan {
     pub env: Vec<(String, String)>,
     /// Start the measured commands with an empty environment, then add `env`.
     pub env_clear: bool,
+    /// Where the power samples come from.
+    pub sensor: Sensor,
 }
 
 impl Plan {
@@ -415,6 +436,8 @@ impl Plan {
             }
         }
 
+        let sensor = Sensor::resolve(args.sensor.as_deref())?;
+
         let (rounds, idle_seconds, work_seconds, settle_seconds) = if args.check {
             (
                 CHECK_ROUNDS,
@@ -439,6 +462,7 @@ impl Plan {
             cwd: args.cwd,
             env,
             env_clear: args.env_clear,
+            sensor,
         })
     }
 

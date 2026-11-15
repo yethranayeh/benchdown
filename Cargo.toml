@@ -14,3 +14,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 shell-words = "1.1"
 signal-hook = "0.4.6"
+
+# AppleSMC reads on macOS, at user level and without sudo.
+[target.'cfg(target_os = "macos")'.dependencies]
+smc = "0.2.4"

@@ -5,12 +5,42 @@ use serde::Serialize;
 use crate::blocks::{BlockKind, BlockRow};
 use crate::gate::{ContaminatedBlock, ContaminationReason};
 use crate::samples::{PowerSample, mean_power_mw, samples_inside};
+use crate::sensor::Sensor;
 
 /// Spread above this fraction means the figure is not stated.
 pub const NOISY_SPREAD: f64 = 0.5;
 
 /// An idle block above this many milliwatts marks its round as disturbed.
 pub const MAXIMUM_IDLE_MW: f64 = 1_000.0;
+
+/// How strict a run is about disturbed rounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limits {
+    /// An idle block above this many milliwatts disturbs its round. `None`
+    /// leaves the idle check out, which is what a whole-system sensor needs:
+    /// it idles far above processor power, and its floor moves with the display.
+    pub maximum_idle_mw: Option<f64>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            maximum_idle_mw: Some(MAXIMUM_IDLE_MW),
+        }
+    }
+}
+
+impl Limits {
+    /// The limits that suit a sensor's scale.
+    pub fn for_sensor(sensor: Sensor) -> Self {
+        match sensor {
+            Sensor::Powermetrics => Self::default(),
+            Sensor::Smc | Sensor::Rapl => Self {
+                maximum_idle_mw: None,
+            },
+        }
+    }
+}
 
 /// A work block above this multiple of its workload's median marks its round as disturbed.
 pub const WORK_SPIKE_FACTOR: f64 = 1.5;
@@ -154,9 +184,10 @@ pub fn analyze(
     samples: &[PowerSample],
     blocks: &[BlockRow],
     contaminated: &[ContaminatedBlock],
+    limits: Limits,
 ) -> Result<Analysis, String> {
     if samples.is_empty() {
-        return Err("no usable samples: processor.combined_power missing from the log".to_owned());
+        return Err("no usable samples: the power log has none for this run".to_owned());
     }
 
     let mut analyses: Vec<BlockAnalysis> = blocks.iter().map(base_analysis).collect();
@@ -177,7 +208,7 @@ pub fn analyze(
     }
 
     let workload_medians = median_work_power(&pairs);
-    let dropped = find_dropped_blocks(blocks, &analyses, &workload_medians);
+    let dropped = find_dropped_blocks(blocks, &analyses, &workload_medians, limits);
     let dropped_rounds: Vec<u64> = {
         let mut rounds: Vec<u64> = dropped.iter().map(|entry| entry.round).collect();
         rounds.extend(contaminated.iter().map(|entry| entry.round));
@@ -338,6 +369,7 @@ fn find_dropped_blocks(
     blocks: &[BlockRow],
     analyses: &[BlockAnalysis],
     workload_medians: &[(String, f64)],
+    limits: Limits,
 ) -> Vec<DroppedBlock> {
     let mut dropped = Vec::new();
     let mut rounds: Vec<u64> = blocks.iter().map(|block| block.round).collect();
@@ -352,14 +384,16 @@ fn find_dropped_blocks(
             let Some(average) = analyses[index].average_mw else {
                 continue;
             };
-            if block.kind == BlockKind::Idle && average > MAXIMUM_IDLE_MW {
+            if let (BlockKind::Idle, Some(maximum)) = (block.kind, limits.maximum_idle_mw)
+                && average > maximum
+            {
                 dropped.push(DroppedBlock {
                     round,
                     label: block.label.clone(),
                     kind: block.kind,
                     reason: DropReason::Idle,
                     observed_mw: average,
-                    limit_mw: MAXIMUM_IDLE_MW,
+                    limit_mw: maximum,
                 });
                 break;
             }
@@ -724,13 +758,14 @@ mod tests {
             samples.extend(round_samples);
             blocks.extend(round_blocks);
         }
-        analyze(&samples, &blocks, contaminated).expect("the run analyzes")
+        analyze(&samples, &blocks, contaminated, Limits::default()).expect("the run analyzes")
     }
 
     #[test]
     fn energy_per_command_subtracts_idle_power_and_divides_by_the_run_count() {
         let (samples, blocks) = pair(1, "x", 0.0, 500.0, 1_500.0, 100);
-        let analysis = analyze(&samples, &blocks, &[]).expect("the run analyzes");
+        let analysis =
+            analyze(&samples, &blocks, &[], Limits::default()).expect("the run analyzes");
         assert_eq!(analysis.idle_median_mw, 500.0);
         assert_eq!(analysis.workloads.len(), 1);
 
@@ -875,7 +910,7 @@ mod tests {
     fn a_work_block_without_an_idle_before_it_is_skipped() {
         let samples = seconds_of(0.0, 10, 1_000.0);
         let blocks = [work(1, "x", 0.0, 10.0, 10)];
-        let error = analyze(&samples, &blocks, &[]).expect_err("nothing pairs");
+        let error = analyze(&samples, &blocks, &[], Limits::default()).expect_err("nothing pairs");
         assert_eq!(error, "no work block has samples: nothing to analyze");
     }
 
@@ -883,13 +918,14 @@ mod tests {
     fn a_work_block_counts_no_commands() {
         let (samples, mut blocks) = pair(1, "x", 0.0, 500.0, 1_500.0, 0);
         blocks[1].count = 0;
-        let error = analyze(&samples, &blocks, &[]).expect_err("no run count");
+        let error = analyze(&samples, &blocks, &[], Limits::default()).expect_err("no run count");
         assert_eq!(error, "Block 1 x ran no commands");
     }
 
     #[test]
     fn no_samples_is_refused() {
-        let error = analyze(&[], &[work(1, "x", 0.0, 10.0, 10)], &[]).expect_err("no samples");
+        let error = analyze(&[], &[work(1, "x", 0.0, 10.0, 10)], &[], Limits::default())
+            .expect_err("no samples");
         assert!(error.starts_with("no usable samples"), "{error}");
     }
 
@@ -905,7 +941,8 @@ mod tests {
             crate::samples::parse_power_log(include_str!("../tests/fixtures/power.plist"));
         let blocks = crate::blocks::parse_blocks(include_str!("../tests/fixtures/blocks.tsv"))
             .expect("the fixture block log parses");
-        let analysis = analyze(&samples, &blocks, &[]).expect("the fixture analyzes");
+        let analysis =
+            analyze(&samples, &blocks, &[], Limits::default()).expect("the fixture analyzes");
 
         // Idle is 115 mW for four seconds, work is 155 mW for four seconds, so the
         // work block carries 620 mJ, 460 mJ of which the idle block explains.

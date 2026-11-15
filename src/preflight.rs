@@ -133,6 +133,7 @@ pub fn run_preflight(
     free_disk_path: &Path,
     write: &mut dyn FnMut(&str),
     stdin_is_terminal: bool,
+    needs_sudo: bool,
 ) -> Result<PreflightReport, String> {
     let battery_output = capture(system, &["pmset", "-g", "batt"])?;
     let power_source = battery_output
@@ -178,7 +179,9 @@ pub fn run_preflight(
         ));
     }
 
-    ensure_sudo_ticket(system, stdin_is_terminal)?;
+    if needs_sudo {
+        ensure_sudo_ticket(system, stdin_is_terminal)?;
+    }
     Ok(PreflightReport {
         power_source,
         battery,
@@ -771,6 +774,7 @@ mod tests {
             Path::new("/"),
             &mut |line| printed.push(line.to_owned()),
             false,
+            true,
         )
         .expect_err("100 MB free is below the minimum");
 
@@ -836,6 +840,7 @@ mod tests {
             Path::new("/"),
             &mut |line| printed.push(line.to_owned()),
             false,
+            true,
         )
         .expect("the machine passes the preflight");
 
@@ -877,6 +882,7 @@ mod tests {
             Path::new("/"),
             &mut |line| printed.push(line.to_owned()),
             false,
+            true,
         )
         .expect("a failing thermal query does not stop the preflight");
 

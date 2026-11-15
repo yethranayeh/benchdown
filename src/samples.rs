@@ -68,6 +68,64 @@ fn power_sample(value: &plist::Value) -> Option<PowerSample> {
     })
 }
 
+/// The header of a samples file, written when the sensor is not powermetrics.
+pub const SAMPLES_HEADER: &str = "start_seconds\tend_seconds\tpower_mw";
+
+/// Whether this text is a benchdown samples file rather than a powermetrics log.
+pub fn is_samples_file(text: &str) -> bool {
+    text.lines().next() == Some(SAMPLES_HEADER)
+}
+
+/// Writes the samples as the three numbers the analysis needs.
+pub fn format_samples(samples: &[PowerSample]) -> String {
+    let mut text = format!("{SAMPLES_HEADER}\n");
+    for sample in samples {
+        text.push_str(&format!(
+            "{:.6}\t{:.6}\t{:.3}\n",
+            sample.start_seconds, sample.end_seconds, sample.power_mw
+        ));
+    }
+    text
+}
+
+/// Reads a samples file written by [`format_samples`].
+pub fn parse_samples_file(text: &str) -> Result<Vec<PowerSample>, String> {
+    let mut lines = text.lines();
+    if lines.next() != Some(SAMPLES_HEADER) {
+        return Err(format!(
+            "not a samples file: expected the header {SAMPLES_HEADER:?}"
+        ));
+    }
+    lines
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() != 3 {
+                return Err(format!("line {}: expected 3 columns", index + 2));
+            }
+            let start: f64 = fields[0]
+                .parse()
+                .map_err(|_| format!("line {}: start_seconds {:?}", index + 2, fields[0]))?;
+            let end: f64 = fields[1]
+                .parse()
+                .map_err(|_| format!("line {}: end_seconds {:?}", index + 2, fields[1]))?;
+            let power_mw: f64 = fields[2]
+                .parse()
+                .map_err(|_| format!("line {}: power_mw {:?}", index + 2, fields[2]))?;
+            if end <= start {
+                return Err(format!("line {}: the window does not advance", index + 2));
+            }
+            Ok(PowerSample {
+                start_seconds: start,
+                end_seconds: end,
+                power_mw,
+                seconds: end - start,
+            })
+        })
+        .collect()
+}
+
 /// A plist number, whether it was written as an integer or a real.
 pub(crate) fn number(value: &plist::Value) -> Option<f64> {
     value.as_real().or_else(|| {
@@ -336,5 +394,51 @@ mod tests {
             println!("run B: {} block rows", blocks.len());
             assert!(!blocks.is_empty());
         }
+    }
+
+    #[test]
+    fn samples_round_trip_through_the_file_format() {
+        let samples = vec![
+            PowerSample {
+                start_seconds: 1_700_000_000.25,
+                end_seconds: 1_700_000_000.75,
+                power_mw: 9_821.437,
+                seconds: 0.5,
+            },
+            PowerSample {
+                start_seconds: 1_700_000_000.75,
+                end_seconds: 1_700_000_001.25,
+                power_mw: 12_000.0,
+                seconds: 0.5,
+            },
+        ];
+        let text = format_samples(&samples);
+        assert!(is_samples_file(&text));
+        let parsed = parse_samples_file(&text).expect("our own format parses");
+        assert_eq!(parsed.len(), 2);
+        assert!((parsed[0].seconds - 0.5).abs() < 1e-6);
+        assert!((parsed[0].power_mw - 9_821.437).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_plist_log_is_not_mistaken_for_a_samples_file() {
+        assert!(!is_samples_file(POWER_LOG));
+        let error = parse_samples_file(POWER_LOG).expect_err("not our format");
+        assert!(error.contains("not a samples file"), "{error}");
+    }
+
+    #[test]
+    fn a_broken_samples_row_names_its_line() {
+        let text = format!("{SAMPLES_HEADER}\n1.0\t2.0\tnope\n");
+        let error = parse_samples_file(&text).expect_err("power is not a number");
+        assert!(error.contains("line 2"), "{error}");
+        assert!(error.contains("power_mw"), "{error}");
+    }
+
+    #[test]
+    fn a_samples_window_that_does_not_advance_is_refused() {
+        let text = format!("{SAMPLES_HEADER}\n1.0\t1.0\t1000.0\n");
+        let error = parse_samples_file(&text).expect_err("no advance");
+        assert!(error.contains("does not advance"), "{error}");
     }
 }

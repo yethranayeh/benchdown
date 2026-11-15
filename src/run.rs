@@ -7,7 +7,8 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::analysis::{
-    Analysis, MINIMUM_CLEAN_ROUNDS, analyze, format_analysis, workloads_short_of_clean_rounds,
+    Analysis, Limits, MINIMUM_CLEAN_ROUNDS, analyze, format_analysis,
+    workloads_short_of_clean_rounds,
 };
 use crate::blocks::{BlockKind, BlockRow, format_header, format_row};
 use crate::cli::{Plan, command_argv, format_seconds};
@@ -15,13 +16,17 @@ use crate::export::{self, RunInfo};
 use crate::gate::{
     QUIET_LOAD, QUIET_WAIT_LIMIT_SECONDS, QuietWait, find_contaminated_blocks, wait_for_quiet,
 };
-use crate::powermetrics::{Powermetrics, START_LEAD_SECONDS, planned_sample_limit};
+use crate::meter::{Sampler, open as open_meter};
+use crate::powermetrics::{
+    Powermetrics, SAMPLE_INTERVAL_MS, START_LEAD_SECONDS, planned_sample_limit,
+};
 use crate::preflight::{
     PowermetricsCheck, PreflightReport, check_powermetrics, run_preflight, start_sudo_keepalive,
 };
 use crate::runner::{CaptureOptions, System, temporary_path};
-use crate::samples::parse_power_log;
+use crate::samples::{PowerSample, parse_power_log};
 use crate::schedule::round_orders;
+use crate::sensor::Sensor;
 use crate::session::sampler::{SESSION_SAMPLES_ENV, read_samples_file};
 
 const MILLISECONDS_PER_SECOND: u64 = 1_000;
@@ -177,6 +182,7 @@ fn to_seconds(milliseconds: u64) -> f64 {
 #[serde(rename_all = "camelCase")]
 struct Meta {
     benchdown_version: String,
+    sensor: String,
     arguments: Vec<String>,
     os_build: String,
     hardware_model: String,
@@ -192,7 +198,8 @@ struct Meta {
 struct PreflightRecord {
     #[serde(flatten)]
     machine: PreflightReport,
-    powermetrics: PowermetricsCheck,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    powermetrics: Option<PowermetricsCheck>,
 }
 
 /// Measures the plan and writes its output folder.
@@ -218,11 +225,17 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
         &directory,
         &mut |line| println!("{line}"),
         std::io::stdin().is_terminal(),
+        plan.sensor.needs_sudo(),
     )?;
 
-    let preflight_power = temporary_path("preflight.plist");
-    let check = check_powermetrics(system, &preflight_power, &mut |line| println!("{line}"))?;
-    let _ = std::fs::remove_file(&preflight_power);
+    let check = if plan.sensor == Sensor::Powermetrics {
+        let preflight_power = temporary_path("preflight.plist");
+        let check = check_powermetrics(system, &preflight_power, &mut |line| println!("{line}"))?;
+        let _ = std::fs::remove_file(&preflight_power);
+        Some(check)
+    } else {
+        None
+    };
 
     std::fs::write(&blocks_path, format!("{}\n", format_header()))
         .map_err(|error| format!("{}: {error}", blocks_path.display()))?;
@@ -240,24 +253,30 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
         format_seconds(planned_seconds),
         format_seconds(longest_seconds)
     );
-    println!("        powermetrics stops by itself after {sample_limit} samples");
+    match plan.sensor {
+        Sensor::Powermetrics => {
+            println!("        powermetrics stops by itself after {sample_limit} samples")
+        }
+        sensor => {
+            println!("        {sensor} is sampled every {SAMPLE_INTERVAL_MS} ms and needs no sudo")
+        }
+    }
 
     let started_at = timestamp(system)?;
-    let mut keepalive = start_sudo_keepalive(system);
+    let mut keepalive = plan
+        .sensor
+        .needs_sudo()
+        .then(|| start_sudo_keepalive(system));
     let awake = system.runner.spawn(&[
         "caffeinate".to_owned(),
         "-is".to_owned(),
         "-w".to_owned(),
         std::process::id().to_string(),
     ])?;
-    let power = Arc::new(Powermetrics::start(
-        system,
-        power_path.clone(),
-        sample_limit,
-    )?);
+    let power = Power::start(plan.sensor, system, &power_path, sample_limit)?;
 
     // A stop by signal skips the normal path, so the sampler is stopped there too.
-    install_signal_handlers(Arc::clone(&power))?;
+    install_signal_handlers(power.clone(), plan.sensor)?;
 
     let mut quiet_waits = Vec::new();
     let mut extra_rounds = 0;
@@ -288,7 +307,12 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
         // A run planned below the minimum, such as --check, is not topped up.
         let tops_up = plan.rounds >= MINIMUM_CLEAN_ROUNDS as u64;
         while tops_up && extra_rounds < MAXIMUM_EXTRA_ROUNDS {
-            let analysis = analyze_so_far(&power_path, &rows, session_samples.as_deref())?;
+            let analysis = analyze_so_far(
+                &power.samples()?,
+                &rows,
+                session_samples.as_deref(),
+                Limits::for_sensor(plan.sensor),
+            )?;
             let short = workloads_short_of_clean_rounds(&analysis);
             if short.is_empty() {
                 break;
@@ -319,17 +343,39 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
 
     power.stop();
     stop_child(system, awake.pid);
-    keepalive.stop();
+    if let Some(keepalive) = keepalive.as_mut() {
+        keepalive.stop();
+    }
 
     // The sampler is stopped and the file handed back before the final read, so
     // the trailing samples are on disk.
     let rows = measured?;
-    let analysis = analyze_so_far(&power_path, &rows, session_samples.as_deref())?;
+    // A counter sensor keeps its samples in memory; write them beside the run's
+    // other files so the run can be analyzed again.
+    if plan.sensor != Sensor::Powermetrics {
+        let samples_file = directory.join("samples.tsv");
+        std::fs::write(
+            &samples_file,
+            crate::samples::format_samples(&power.samples()?),
+        )
+        .map_err(|error| format!("{}: {error}", samples_file.display()))?;
+        println!("Samples: {}", samples_file.display());
+    }
+    let analysis = analyze_so_far(
+        &power.samples()?,
+        &rows,
+        session_samples.as_deref(),
+        Limits::for_sensor(plan.sensor),
+    )?;
     let ended_at = timestamp(system)?;
-    let os_build = check.build.clone();
-    let hardware_model = hardware_model(&power_path);
+    let os_build = match &check {
+        Some(check) => check.build.clone(),
+        None => os_build(system),
+    };
+    let hardware_model = hardware_model(system, &power_path, plan.sensor);
     let meta = Meta {
         benchdown_version: env!("CARGO_PKG_VERSION").to_owned(),
+        sensor: plan.sensor.to_string(),
         arguments: std::env::args().skip(1).collect(),
         os_build: os_build.clone(),
         hardware_model: hardware_model.clone(),
@@ -367,6 +413,8 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
         println!("Exported: {}", path.display());
     }
 
+    println!();
+    println!("Sensor: {} — {}", plan.sensor, plan.sensor.describes());
     println!();
     println!("{}", format_analysis(&analysis).join("\n"));
     println!();
@@ -466,19 +514,80 @@ fn append_block(path: &Path, row: &BlockRow) -> Result<(), String> {
     writeln!(file, "{}", format_row(row)).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// The running power source.
+///
+/// powermetrics writes a plist that is parsed again for each extra round; the
+/// counter sensors sample into memory. Both hand back the same samples.
+#[derive(Clone)]
+enum Power {
+    Powermetrics {
+        sampler: Arc<Powermetrics>,
+        path: PathBuf,
+    },
+    Sampler(Arc<Sampler>),
+}
+
+impl Power {
+    fn start(
+        sensor: Sensor,
+        system: &System,
+        power_path: &Path,
+        sample_limit: u64,
+    ) -> Result<Self, String> {
+        if sensor == Sensor::Powermetrics {
+            return Ok(Self::Powermetrics {
+                sampler: Arc::new(Powermetrics::start(
+                    system,
+                    power_path.to_path_buf(),
+                    sample_limit,
+                )?),
+                path: power_path.to_path_buf(),
+            });
+        }
+        Ok(Self::Sampler(Arc::new(Sampler::start(
+            open_meter(sensor)?,
+            SAMPLE_INTERVAL_MS,
+        )?)))
+    }
+
+    /// The samples taken so far, in time order.
+    fn samples(&self) -> Result<Vec<PowerSample>, String> {
+        match self {
+            Self::Powermetrics { path, .. } => {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                Ok(parse_power_log(&text))
+            }
+            Self::Sampler(sampler) => {
+                let samples = sampler.samples();
+                match (samples.is_empty(), sampler.failure()) {
+                    (true, Some(failure)) => Err(format!("the sensor stopped: {failure}")),
+                    _ => Ok(samples),
+                }
+            }
+        }
+    }
+
+    /// Safe to call twice.
+    fn stop(&self) {
+        match self {
+            Self::Powermetrics { sampler, .. } => sampler.stop(),
+            Self::Sampler(sampler) => sampler.stop(),
+        }
+    }
+}
+
 fn analyze_so_far(
-    power_path: &Path,
+    samples: &[PowerSample],
     rows: &[BlockRow],
     session_samples: Option<&Path>,
+    limits: Limits,
 ) -> Result<Analysis, String> {
-    let text = std::fs::read_to_string(power_path)
-        .map_err(|error| format!("{}: {error}", power_path.display()))?;
-    let samples = parse_power_log(&text);
     let contaminated = match session_samples {
         Some(path) => find_contaminated_blocks(&read_samples_file(path)?, rows),
         None => Vec::new(),
     };
-    analyze(&samples, rows, &contaminated)
+    analyze(samples, rows, &contaminated, limits)
 }
 
 /// The samples file named by the session, checked before the sampler starts.
@@ -527,7 +636,7 @@ fn workload_labels(workloads: &[Workload]) -> Vec<String> {
         .collect()
 }
 
-fn install_signal_handlers(power: Arc<Powermetrics>) -> Result<(), String> {
+fn install_signal_handlers(power: Power, sensor: Sensor) -> Result<(), String> {
     let mut signals =
         signal_hook::iterator::Signals::new(SIGNAL_EXIT_CODES.map(|(signal, _)| signal))
             .map_err(|error| format!("could not watch for signals: {error}"))?;
@@ -538,7 +647,7 @@ fn install_signal_handlers(power: Arc<Powermetrics>) -> Result<(), String> {
                 .find(|(number, _)| *number == signal)
                 .map(|(_, code)| *code)
                 .unwrap_or(1);
-            eprintln!("Stopped by signal {signal}. Stopping powermetrics.");
+            eprintln!("Stopped by signal {signal}. Stopping the {sensor} sampler.");
             power.stop();
             std::process::exit(code);
         }
@@ -578,7 +687,41 @@ fn default_output_directory(system: &System) -> Result<PathBuf, String> {
     )))
 }
 
-fn hardware_model(power_path: &Path) -> String {
+/// The macOS build, from `sysctl`, when no powermetrics sample supplies it.
+fn os_build(system: &System) -> String {
+    system
+        .runner
+        .capture(
+            &["sysctl", "-n", "kern.osversion"].map(str::to_owned),
+            CaptureOptions::default(),
+        )
+        .map(|output| {
+            if output.succeeded() {
+                output.stdout.trim().to_owned()
+            } else {
+                "unknown".to_owned()
+            }
+        })
+        .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+fn hardware_model(system: &System, power_path: &Path, sensor: Sensor) -> String {
+    if sensor != Sensor::Powermetrics {
+        return system
+            .runner
+            .capture(
+                &["sysctl", "-n", "hw.model"].map(str::to_owned),
+                CaptureOptions::default(),
+            )
+            .map(|output| {
+                if output.succeeded() {
+                    output.stdout.trim().to_owned()
+                } else {
+                    "unknown".to_owned()
+                }
+            })
+            .unwrap_or_else(|_| "unknown".to_owned());
+    }
     let Ok(text) = std::fs::read_to_string(power_path) else {
         return "unknown".to_owned();
     };
@@ -904,7 +1047,9 @@ mod tests {
         )
         .expect("the samples file writes");
 
-        let analysis = analyze_so_far(&power_path, &blocks, Some(&samples_path))
+        let text = std::fs::read_to_string(&power_path).expect("the power fixture reads");
+        let samples = parse_power_log(&text);
+        let analysis = analyze_so_far(&samples, &blocks, Some(&samples_path), Limits::default())
             .expect("the fixture analyzes");
 
         assert_eq!(analysis.contaminated_blocks.len(), 1);
@@ -933,12 +1078,12 @@ mod tests {
                 load_average: 1.69,
                 free_bytes: 5_212_016_640,
             },
-            powermetrics: PowermetricsCheck {
+            powermetrics: Some(PowermetricsCheck {
                 sample_count: 2,
                 build: "24G517".to_owned(),
                 build_verified: true,
                 issues: Vec::new(),
-            },
+            }),
         };
 
         let json = serde_json::to_value(&record).expect("the record serializes");
