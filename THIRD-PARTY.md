@@ -1,6 +1,6 @@
 # Third-party notices
 
-benchdown is MIT OR Apache-2.0. It contains code and constants adapted from the
+benchdown is MIT licensed. It contains code and constants adapted from the
 projects below.
 
 ## EnergiBridge

@@ -100,12 +100,11 @@ use the [`smc`](https://crates.io/crates/smc) crate (WTFPL). See
 
 ## Licence
 
-Licensed under either of
+The benchdown software is [MIT licensed](LICENSE).
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
-
-at your option.
+The name and the logo are not part of that license. They identify the project,
+so a fork should ship under its own name. [TRADEMARK.md](TRADEMARK.md) has the
+short version.
 
 ## Issues
 
