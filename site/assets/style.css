@@ -1,0 +1,59 @@
+/* The mark sits in the header beside the wordmark. It is inlined by
+   layouts/partials/logo.html, which reads assets/brand/benchdown-mark.svg
+   (mounted from ../assets) and swaps the fill for currentColor, so the theme's
+   colours drive it. */
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding-right: 1rem;
+  text-decoration: none;
+}
+
+.brand__mark {
+  display: block;
+  flex: 0 0 auto;
+  height: 1.6em;
+  width: auto;
+}
+
+.brand__name {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+/* Headings are the same colour as body text by default, which flattens a page
+   that has no accent hue to separate them. */
+h1,
+h2,
+h3,
+h4 {
+  color: var(--accent);
+}
+
+.content > h1:first-child {
+  margin: 1.25rem 0 1.5rem;
+  font-size: clamp(1.7rem, 4vw, 2.4rem);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+
+/* The theme paints list markers in the accent, which is white here; keep them
+   quiet instead. */
+li::marker {
+  color: var(--foreground);
+  opacity: 0.5;
+}
+
+blockquote {
+  opacity: 0.85;
+}
+
+/* The dashed rule after the wordmark is a nice divider on a wide screen and a
+   collision with the menu button on a narrow one. */
+@media (max-width: 684px) {
+  .header__logo::after {
+    display: none;
+  }
+}

@@ -1,0 +1,6 @@
+/* Monochrome: white on near-black, the way the mark is drawn. */
+:root {
+  --background: #0b0b0b;
+  --foreground: #d8d4cc;
+  --accent: #ffffff;
+}

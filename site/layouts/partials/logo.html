@@ -1,0 +1,15 @@
+{{- $path := "assets/brand/benchdown-mark.svg" -}}
+{{- $mark := "" -}}
+{{- with resources.Get "brand/benchdown-mark.svg" -}}
+  {{- $raw := .Content -}}
+  {{- $raw = replaceRE `(?s)<title>.*?</title>` "" $raw -}}
+  {{- $raw = replaceRE `(?s)<svg[^>]*>` `<svg class="brand__mark" viewBox="0 0 600 700" aria-hidden="true" focusable="false">` $raw -}}
+  {{- $raw = replaceRE `fill="#17150f"` `fill="currentColor"` $raw -}}
+  {{- $mark = $raw | safeHTML -}}
+{{- else -}}
+  {{- warnf "benchdown: mark not found at %s" $path -}}
+{{- end -}}
+<a class="brand" href="{{ site.Params.Logo.LogoHomeLink | default site.BaseURL }}">
+  {{ $mark }}
+  <span class="brand__name">{{ site.Params.Logo.logoText | default site.Title }}</span>
+</a>
