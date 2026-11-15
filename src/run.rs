@@ -257,9 +257,12 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
         Sensor::Powermetrics => {
             println!("        powermetrics stops by itself after {sample_limit} samples")
         }
-        sensor => {
-            println!("        {sensor} is sampled every {SAMPLE_INTERVAL_MS} ms and needs no sudo")
+        Sensor::Smc => {
+            println!("        smc is sampled every {SAMPLE_INTERVAL_MS} ms and needs no sudo")
         }
+        Sensor::Rapl => println!(
+            "        rapl is sampled every {SAMPLE_INTERVAL_MS} ms; reading /dev/cpu/*/msr needs root"
+        ),
     }
 
     let started_at = timestamp(system)?;
