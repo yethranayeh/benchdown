@@ -8,9 +8,9 @@ on:
 jobs:
   macos:
     name: macOS (fmt, clippy, tests)
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -21,9 +21,9 @@ jobs:
 
   package:
     name: Crate package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Builds the tarball the registry would receive, so a file behind
@@ -32,9 +32,9 @@ jobs:
 
   linux:
     name: Linux (clippy, tests compiled)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
