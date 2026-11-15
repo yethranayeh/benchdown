@@ -19,6 +19,17 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  package:
+    name: Crate package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Builds the tarball the registry would receive, so a file behind
+      # include_str!, the licences or the readme cannot go missing unnoticed.
+      - run: cargo publish --dry-run --locked
+
   linux:
     name: Linux (clippy, tests compiled)
     runs-on: ubuntu-latest

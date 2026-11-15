@@ -6,6 +6,9 @@ rust-version = "1.85"
 description = "Measure a command's processor energy the way hyperfine measures its time"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/yethranayeh/benchdown"
+keywords = ["benchmark", "energy", "power", "profiling", "measurement"]
+categories = ["command-line-utilities", "development-tools::profiling", "hardware-support"]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }

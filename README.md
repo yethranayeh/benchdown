@@ -11,7 +11,7 @@ per command with its spread.
 
 ## Install
 
-Rust 1.85 or newer, on macOS:
+Rust 1.85 or newer, on macOS or Linux:
 
 ```sh
 cargo install --path .
