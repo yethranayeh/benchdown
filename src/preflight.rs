@@ -96,9 +96,20 @@ pub struct ThermalState {
     pub cpu_power_limit: Option<u32>,
 }
 
+impl BatteryState {
+    /// The state recorded when the machine has no battery at all.
+    pub fn absent() -> Self {
+        Self {
+            present: false,
+            percent: None,
+            state: NO_BATTERY.to_owned(),
+        }
+    }
+}
+
 impl ThermalState {
     /// The state recorded when the machine reports nothing.
-    fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             warning: None,
             performance_warning: None,
@@ -135,14 +146,7 @@ pub fn run_preflight(
     stdin_is_terminal: bool,
     needs_sudo: bool,
 ) -> Result<PreflightReport, String> {
-    let battery_output = capture(system, &["pmset", "-g", "batt"])?;
-    let power_source = battery_output
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    let battery = parse_battery(&battery_output);
+    let (power_source, battery) = read_power_state(system)?;
     let thermal = read_thermal(system);
     let load_values = read_load_values(system)?;
     let load_average = load_values.first().copied().unwrap_or(0.0);
@@ -488,13 +492,10 @@ fn describe_value(value: Option<&plist::Value>) -> String {
 ///
 /// The first line names the power source and each following non-empty line is
 /// one battery. A Mac with no battery prints no such line.
+#[cfg(any(target_os = "macos", test))]
 pub fn parse_battery(output: &str) -> BatteryState {
     let Some(line) = output.lines().skip(1).find(|line| !line.trim().is_empty()) else {
-        return BatteryState {
-            present: false,
-            percent: None,
-            state: NO_BATTERY.to_owned(),
-        };
+        return BatteryState::absent();
     };
     let Some((before_percent, after_percent)) = line.split_once('%') else {
         return BatteryState {
@@ -513,6 +514,7 @@ pub fn parse_battery(output: &str) -> BatteryState {
 
 /// The digits that end the text before `%`, such as the `82` in
 /// ` -InternalBattery-0 (id=22085731)\t82`.
+#[cfg(any(target_os = "macos", test))]
 fn trailing_percent(text: &str) -> Option<u8> {
     text.trim_end()
         .rsplit(|character: char| !character.is_ascii_digit())
@@ -521,6 +523,7 @@ fn trailing_percent(text: &str) -> Option<u8> {
 }
 
 /// The charging state after the percentage, without the `present: true` marker.
+#[cfg(any(target_os = "macos", test))]
 fn charging_state(text: &str) -> String {
     let state = text.trim_start_matches([';', ' ']).trim();
     let state = state.strip_suffix("present: true").unwrap_or(state).trim();
@@ -536,6 +539,7 @@ fn charging_state(text: &str) -> String {
 /// A machine that has recorded no warning prints `Note: No thermal warning
 /// level has been recorded` in place of a level, and one without CPU power
 /// status prints no limit lines. Both leave the corresponding field `null`.
+#[cfg(any(target_os = "macos", test))]
 pub fn parse_thermal(output: &str) -> ThermalState {
     let mut thermal = ThermalState::none();
     for line in output.lines() {
@@ -561,6 +565,7 @@ pub fn parse_thermal(output: &str) -> ThermalState {
 }
 
 /// The number after `name =` in one lower-cased line, when the line has it.
+#[cfg(any(target_os = "macos", test))]
 fn value_after(line: &str, name: &str) -> Option<u32> {
     let (_, rest) = line.split_once(name)?;
     let rest = rest.trim_start().strip_prefix('=')?;
@@ -574,10 +579,35 @@ fn value_after(line: &str, name: &str) -> Option<u32> {
 
 /// Reads the thermal state, never failing the preflight for it.
 fn read_thermal(system: &System) -> ThermalState {
-    let arguments = ["pmset", "-g", "therm"].map(str::to_owned);
-    match system.runner.capture(&arguments, CaptureOptions::default()) {
-        Ok(captured) if captured.succeeded() => parse_thermal(&captured.stdout),
-        _ => ThermalState::none(),
+    #[cfg(target_os = "macos")]
+    {
+        let arguments = ["pmset", "-g", "therm"].map(str::to_owned);
+        match system.runner.capture(&arguments, CaptureOptions::default()) {
+            Ok(captured) if captured.succeeded() => parse_thermal(&captured.stdout),
+            _ => ThermalState::none(),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = system;
+        crate::platform::linux::thermal_state()
+    }
+}
+
+/// Reads the power source and the battery, from the platform's own source.
+fn read_power_state(system: &System) -> Result<(String, BatteryState), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = capture(system, &["pmset", "-g", "batt"])?;
+        let source = output.lines().next().unwrap_or("").trim().to_owned();
+        Ok((source, parse_battery(&output)))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = system;
+        crate::platform::linux::power_supply(std::path::Path::new(
+            crate::platform::linux::POWER_SUPPLY_PATH,
+        ))
     }
 }
 
@@ -596,16 +626,26 @@ fn capture(system: &System, argv: &[&str]) -> Result<String, String> {
 }
 
 fn read_load_values(system: &System) -> Result<Vec<f64>, String> {
-    let output = capture(system, &["sysctl", "-n", "vm.loadavg"])?;
-    let values: Vec<f64> = output
-        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| part.parse().ok())
-        .collect();
-    if values.len() < 3 {
-        return Err(format!("Could not parse load averages from: {output}"));
+    #[cfg(target_os = "linux")]
+    {
+        let _ = system;
+        let text = std::fs::read_to_string(crate::platform::linux::LOAD_PATH)
+            .map_err(|error| format!("{}: {error}", crate::platform::linux::LOAD_PATH))?;
+        crate::platform::linux::parse_loadavg(&text)
     }
-    Ok(values.into_iter().take(3).collect())
+    #[cfg(target_os = "macos")]
+    {
+        let output = capture(system, &["sysctl", "-n", "vm.loadavg"])?;
+        let values: Vec<f64> = output
+            .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        if values.len() < 3 {
+            return Err(format!("Could not parse load averages from: {output}"));
+        }
+        Ok(values.into_iter().take(3).collect())
+    }
 }
 
 fn read_free_bytes(system: &System, target: &Path) -> Result<u64, String> {
@@ -623,22 +663,30 @@ fn read_free_bytes(system: &System, target: &Path) -> Result<u64, String> {
 }
 
 fn read_busiest_processes(system: &System) -> Result<Vec<String>, String> {
-    let output = capture(system, &["ps", "-Ao", "%cpu,comm", "-r"])?;
-    Ok(output
-        .lines()
-        .skip(1)
-        .take(BUSIEST_PROCESS_COUNT)
-        .map(|line| {
-            let trimmed = line.trim();
-            let end = trimmed
-                .char_indices()
-                .nth(PROCESS_LINE_WIDTH)
-                .map(|(index, _)| index)
-                .unwrap_or(trimmed.len());
-            trimmed[..end].to_owned()
-        })
-        .filter(|line| !line.is_empty())
-        .collect())
+    #[cfg(target_os = "linux")]
+    {
+        let output = capture(system, &["ps", "-eo", "pcpu,comm", "--sort=-pcpu"])?;
+        Ok(crate::platform::linux::parse_processes(&output))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = capture(system, &["ps", "-Ao", "%cpu,comm", "-r"])?;
+        Ok(output
+            .lines()
+            .skip(1)
+            .take(BUSIEST_PROCESS_COUNT)
+            .map(|line| {
+                let trimmed = line.trim();
+                let end = trimmed
+                    .char_indices()
+                    .nth(PROCESS_LINE_WIDTH)
+                    .map(|(index, _)| index)
+                    .unwrap_or(trimmed.len());
+                trimmed[..end].to_owned()
+            })
+            .filter(|line| !line.is_empty())
+            .collect())
+    }
 }
 
 #[cfg(test)]

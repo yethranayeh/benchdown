@@ -7,6 +7,7 @@ mod clock;
 mod export;
 mod gate;
 mod meter;
+mod platform;
 mod powermetrics;
 mod preflight;
 mod random;

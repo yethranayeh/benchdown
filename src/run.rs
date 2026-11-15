@@ -267,12 +267,7 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
         .sensor
         .needs_sudo()
         .then(|| start_sudo_keepalive(system));
-    let awake = system.runner.spawn(&[
-        "caffeinate".to_owned(),
-        "-is".to_owned(),
-        "-w".to_owned(),
-        std::process::id().to_string(),
-    ])?;
+    let awake = start_keep_awake(system)?;
     let power = Power::start(plan.sensor, system, &power_path, sample_limit)?;
 
     // A stop by signal skips the normal path, so the sampler is stopped there too.
@@ -342,7 +337,9 @@ pub fn run(plan: &Plan, system: &System) -> Result<(), String> {
     })(&mut quiet_waits);
 
     power.stop();
-    stop_child(system, awake.pid);
+    if let Some(pid) = awake {
+        stop_child(system, pid);
+    }
     if let Some(keepalive) = keepalive.as_mut() {
         keepalive.stop();
     }
@@ -480,27 +477,38 @@ fn run_rounds(
 fn load_reader(system: &System) -> impl FnMut() -> Result<f64, String> {
     let runner = Arc::clone(&system.runner);
     move || {
-        let output = runner.capture(
-            &["sysctl", "-n", "vm.loadavg"].map(str::to_owned),
-            CaptureOptions::default(),
-        )?;
-        if !output.succeeded() {
-            return Err(format!(
-                "sysctl failed with exit code {}: {}",
-                output.exit_code,
-                output.stderr.trim()
-            ));
+        #[cfg(target_os = "linux")]
+        {
+            let _ = &runner;
+            let text = std::fs::read_to_string(crate::platform::linux::LOAD_PATH)
+                .map_err(|error| format!("{}: {error}", crate::platform::linux::LOAD_PATH))?;
+            let values = crate::platform::linux::parse_loadavg(&text)?;
+            Ok(values[0])
         }
-        output
-            .stdout
-            .split(|character: char| !(character.is_ascii_digit() || character == '.'))
-            .find_map(|part| part.parse().ok())
-            .ok_or_else(|| {
-                format!(
-                    "Could not parse the load average from: {}",
-                    output.stdout.trim()
-                )
-            })
+        #[cfg(target_os = "macos")]
+        {
+            let output = runner.capture(
+                &["sysctl", "-n", "vm.loadavg"].map(str::to_owned),
+                CaptureOptions::default(),
+            )?;
+            if !output.succeeded() {
+                return Err(format!(
+                    "sysctl failed with exit code {}: {}",
+                    output.exit_code,
+                    output.stderr.trim()
+                ));
+            }
+            output
+                .stdout
+                .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+                .find_map(|part| part.parse().ok())
+                .ok_or_else(|| {
+                    format!(
+                        "Could not parse the load average from: {}",
+                        output.stdout.trim()
+                    )
+                })
+        }
     }
 }
 
@@ -689,25 +697,68 @@ fn default_output_directory(system: &System) -> Result<PathBuf, String> {
 
 /// The macOS build, from `sysctl`, when no powermetrics sample supplies it.
 fn os_build(system: &System) -> String {
-    system
-        .runner
-        .capture(
-            &["sysctl", "-n", "kern.osversion"].map(str::to_owned),
-            CaptureOptions::default(),
-        )
-        .map(|output| {
-            if output.succeeded() {
-                output.stdout.trim().to_owned()
-            } else {
-                "unknown".to_owned()
-            }
-        })
-        .unwrap_or_else(|_| "unknown".to_owned())
+    #[cfg(target_os = "linux")]
+    let arguments = ["uname", "-r"].map(str::to_owned);
+    #[cfg(target_os = "macos")]
+    let arguments = ["sysctl", "-n", "kern.osversion"].map(str::to_owned);
+    let Ok(output) = system.runner.capture(&arguments, CaptureOptions::default()) else {
+        return "unknown".to_owned();
+    };
+    if !output.succeeded() {
+        return "unknown".to_owned();
+    }
+    #[cfg(target_os = "linux")]
+    return crate::platform::linux::os_build(&output.stdout);
+    #[cfg(target_os = "macos")]
+    return output.stdout.trim().to_owned();
+}
+
+/// Starts whatever keeps the machine awake, or reports that nothing does.
+fn start_keep_awake(system: &System) -> Result<Option<u32>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let spawned = system.runner.spawn(&[
+            "caffeinate".to_owned(),
+            "-is".to_owned(),
+            "-w".to_owned(),
+            std::process::id().to_string(),
+        ])?;
+        Ok(Some(spawned.pid))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(crate::platform::linux::keep_awake(system))
+    }
 }
 
 fn hardware_model(system: &System, power_path: &Path, sensor: Sensor) -> String {
     if sensor != Sensor::Powermetrics {
-        return system
+        return machine_model(system);
+    }
+    let Ok(text) = std::fs::read_to_string(power_path) else {
+        return "unknown".to_owned();
+    };
+    crate::samples::parse_records(&text)
+        .first()
+        .and_then(|record| record.as_dictionary())
+        .and_then(|record| record.get("hw_model"))
+        .and_then(|value| value.as_string())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// The machine model, when no powermetrics sample supplies it.
+fn machine_model(system: &System) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = system;
+        crate::platform::linux::hardware_model(std::path::Path::new(
+            crate::platform::linux::HARDWARE_MODEL_PATH,
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        system
             .runner
             .capture(
                 &["sysctl", "-n", "hw.model"].map(str::to_owned),
@@ -720,18 +771,8 @@ fn hardware_model(system: &System, power_path: &Path, sensor: Sensor) -> String 
                     "unknown".to_owned()
                 }
             })
-            .unwrap_or_else(|_| "unknown".to_owned());
+            .unwrap_or_else(|_| "unknown".to_owned())
     }
-    let Ok(text) = std::fs::read_to_string(power_path) else {
-        return "unknown".to_owned();
-    };
-    crate::samples::parse_records(&text)
-        .first()
-        .and_then(|record| record.as_dictionary())
-        .and_then(|record| record.get("hw_model"))
-        .and_then(|value| value.as_string())
-        .map(str::to_owned)
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// The operating system and architecture hyperfine records in its metadata.

@@ -50,7 +50,9 @@ A string it cannot split is refused before the run starts.
   display and peripherals included. It idles far above processor power, so the
   idle limit does not apply and only the work-spike rule can drop a round.
 - `rapl` (Linux default): Intel or AMD package energy from the RAPL counters.
-  Needs the `msr` module and read access to `/dev/cpu/*/msr`.
+  Needs the `msr` module and read access to `/dev/cpu/*/msr`. Everything else
+  the run checks — load, disk, power source, battery, machine model — comes
+  from `/proc`, `/sys` and `uname`, so nothing has to be installed.
 
 Every run records the sensor it used in `meta.json` and prints it above the
 table. `benchdown analyze` takes the same `--sensor` so a log is analyzed with
