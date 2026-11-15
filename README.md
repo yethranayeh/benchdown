@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yethranayeh/benchdown/main/assets/benchdown-mark-light.svg">
+    <img alt="benchdown" src="https://raw.githubusercontent.com/yethranayeh/benchdown/main/assets/benchdown-mark.svg" width="104">
+  </picture>
+</p>
+
 # benchdown
 
 benchdown measures how much processor energy a command uses, the way hyperfine

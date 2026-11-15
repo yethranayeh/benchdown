@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 700" width="120" height="140">
+  <title>benchdown</title>
+  <g fill="#f4f1e9">
+    <rect x="10" y="10" width="80" height="580" rx="16"/>
+    <rect x="110" y="10" width="80" height="580" rx="16"/>
+    <rect x="210" y="210" width="80" height="80" rx="16"/>
+    <rect x="310" y="210" width="80" height="80" rx="16"/>
+    <rect x="210" y="310" width="80" height="80" rx="16"/>
+    <rect x="310" y="310" width="80" height="80" rx="16"/>
+    <rect x="410" y="310" width="80" height="80" rx="16"/>
+    <rect x="510" y="310" width="80" height="280" rx="16"/>
+    <rect x="410" y="410" width="80" height="280" rx="16"/>
+    <rect x="110" y="610" width="80" height="80" rx="16"/>
+    <rect x="210" y="610" width="80" height="80" rx="16"/>
+    <rect x="310" y="610" width="80" height="80" rx="16"/>
+  </g>
+</svg>
